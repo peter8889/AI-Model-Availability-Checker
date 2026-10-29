@@ -100,7 +100,7 @@ tkinter 常被诟病卡顿，但问题通常不在 Python，而在渲染方式�
 
 ## 安装与使用
 
-1. 从 [Releases](https://github.com/peter8889/AI-Model-Availability-Checker/releases) 下载 `ModelChecker-v2.2.exe`
+1. 从 [Releases](https://github.com/peter8889/AI-Model-Availability-Checker/releases/latest) 下载 `ModelChecker-v2.3.exe`
 2. 双击运行，首次启动会弹出使用协议
 3. 填入接口地址（如 `https://dashscope.aliyuncs.com/compatible-mode/v1`）和 API Key
 4. 点「选择模型」多选，或直接点「开始检测」跑全量
@@ -131,8 +131,9 @@ tkinter 常被诟病卡顿，但问题通常不在 Python，而在渲染方式�
 | 版本 | SHA-256 |
 | --- | --- |
 | v1.0 | `ad34ea6fa0257e315c0983870b08c081156cd622248d7a01615915291f77e0b4` |
-| v2.1 | `6ef13886e78ba462721567d0cc94d22e05c162a67eef62d18bb5b18e775fa5f7` |
+| v2.3 | `c8ee22c6b7f570df33cb351deeef55adaafd52ac6166a627ae7d14dbd296b541` |
 | v2.2 | `510f7e7948401e62ed48121d3dbd5a95c03db431dc44472e2e4ba902b82af1ce` |
+| v2.1 | `6ef13886e78ba462721567d0cc94d22e05c162a67eef62d18bb5b18e775fa5f7` |
 
 ## 从源码构建
 
