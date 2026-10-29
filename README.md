@@ -26,7 +26,7 @@
 
 ## 界面
 
-<p align="center"><img src="docs/preview/main.png" alt="主界面" width="860"></p>
+<p align="center"><img src="docs/preview/main.jpg" alt="主界面" width="860"></p>
 
 <table>
 <tr>
