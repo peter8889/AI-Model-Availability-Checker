@@ -116,6 +116,7 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed ^
 
 | 版本 | 主要内容 |
 | --- | --- |
+| [v2.3](https://github.com/peter8889/AI-Model-Availability-Checker/releases/tag/v2.3) | **性能提升 8.8 倍**（增量渲染 + 合并刷新 + move 排序，掉帧归零）；软件内更新与自替换重启；「未检测」状态与三选一检测范围；彩蛋可滚动、实时进度、暂停、离线作答；API 到期检测；一键清空；检测中实时开关思考 |
 | [v2.2](https://github.com/peter8889/AI-Model-Availability-Checker/releases/tag/v2.2) | 思考能力探测（11 家厂商参数差异自适应）、上下文/输出规格列、用量金额估算、余额查询、洗车彩蛋 |
 | [v2.1](https://github.com/peter8889/AI-Model-Availability-Checker/releases/tag/v2.1) | 中文失败原因、受限独立状态、延迟与能力列、暗夜模式、背景横幅、使用协议与隐私说明、Token 统计 |
 | [v1.0](https://github.com/peter8889/AI-Model-Availability-Checker/releases/tag/v1.0) | 首个版本：模型清单拉取、并发探活、七类状态判定、CSV/JSON 导出、命令行与图形界面双版本 |

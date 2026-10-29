@@ -17,12 +17,14 @@
 """
 
 import csv
+import datetime
 import ctypes
 import json
 import os
 import queue
 import random
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -37,7 +39,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
 
 APP_NAME = "AI 模型检测"
-APP_VER = "2.2"
+APP_VER = "2.3"
 UPDATE_REPO = "peter8889/AI-Model-Availability-Checker"
 TELEGRAM = "https://t.me/OiPeter"
 USD_RATE = 7.1   # 美元→人民币折算（仅参考）
@@ -78,12 +80,15 @@ RATE = "限流"
 UNKNOWN = "未知"
 KEY_BAD = "密钥失效"
 SKIP = "跳过"
+PENDING = "未检测"
 
-GROUP = {OK: 0, DEGRADED: 1, MISSING: 2, NO_ACCESS: 2, RATE: 2, UNKNOWN: 2, KEY_BAD: 2, SKIP: 3}
+GROUP = {OK: 0, DEGRADED: 1, MISSING: 2, NO_ACCESS: 2, RATE: 2, UNKNOWN: 2,
+         KEY_BAD: 2, SKIP: 3, PENDING: 4}
 BADGE = {
     OK: ("✔", "ok"), DEGRADED: ("!", "limited"), MISSING: ("✖", "bad"),
     NO_ACCESS: ("✖", "bad"), RATE: ("…", "muted"), UNKNOWN: ("?", "muted"),
     KEY_BAD: ("✖", "bad"), SKIP: ("–", "muted"),
+    PENDING: ("◌", "muted"),
 }
 
 MISSING_PAT = re.compile(
@@ -140,7 +145,7 @@ def zh_reason(status, detail=""):
 
 
 # ---------------------------------------------------------------- 网络
-def http_json(method, url, key, payload=None, timeout=25):
+def http_json(method, url, key, payload=None, timeout=25, with_headers=False):
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
@@ -148,18 +153,25 @@ def http_json(method, url, key, payload=None, timeout=25):
     if key:
         req.add_header("Authorization", "Bearer " + key)
     t0 = time.perf_counter()
+
+    def done(st, body, hdrs=None):
+        ms = (time.perf_counter() - t0) * 1000
+        return (st, body, hdrs or {}) if with_headers else (st, body, ms)
+
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read(MAX_BODY)
-            return r.status, raw.decode("utf-8", "replace"), (time.perf_counter() - t0) * 1000
+            hdrs = {k.lower(): v for k, v in (r.headers.items() if r.headers else [])}
+            return done(r.status, raw.decode("utf-8", "replace"), hdrs)
     except urllib.error.HTTPError as e:
         try:
             body = e.read(MAX_BODY).decode("utf-8", "replace")
         except Exception:
             body = ""
-        return e.code, body, (time.perf_counter() - t0) * 1000
+        hdrs = {k.lower(): v for k, v in (e.headers.items() if e.headers else [])}
+        return done(e.code, body, hdrs)
     except Exception as e:
-        return None, f"{type(e).__name__}: {e}", (time.perf_counter() - t0) * 1000
+        return done(None, f"{type(e).__name__}: {e}", {})
 
 
 def http_stream(url, key, payload, timeout=25):
@@ -733,6 +745,117 @@ def test_special(base, key, model, timeout):
     return res
 
 
+KEY_EXPIRY_HEADERS = ("x-key-expires-at", "x-api-key-expires-at", "x-ratelimit-reset",
+                        "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens",
+                        "x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens")
+
+
+def _parse_ts(v):
+    """把秒/毫秒时间戳或 HTTP 日期解析成 datetime。"""
+    if not v:
+        return None
+    v = str(v).strip()
+    try:
+        n = float(v)
+        if n > 1e12:
+            n /= 1000.0
+        if n > 1e8:
+            return datetime.datetime.fromtimestamp(n)
+    except Exception:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        return parsedate_to_datetime(v)
+    except Exception:
+        return None
+
+
+def query_key_status(base, key, timeout=8):
+    """查询 Key 状态：能否用、到期时间、限流配额。
+
+    OpenAI 兼容协议本身没有「Key 到期」字段，因此这里做三件事：
+    1) 读响应头里可能存在的到期/限额字段（各家自行扩展的 x-* 头）；
+    2) 读 /models 或 /me 类接口返回体里的 expiry / expire_at 等字段；
+    3) 兜底：只看 Key 当前是否有效，并明确说明「无法获取到期时间」。
+    """
+    host = ""
+    try:
+        host = urllib.parse.urlsplit(normalize_base(base)).hostname or ""
+    except Exception:
+        pass
+    if not host:
+        return {"ok": False, "reason": "接口地址为空", "expires": None,
+                "limits": [], "note": ""}
+
+    out = {"ok": False, "reason": "", "expires": None, "limits": [], "note": ""}
+    # 1) 用 /models 探测有效性，并抓响应头
+    status, body, hdrs = http_json("GET", normalize_base(base).rstrip("/") + "/models",
+                                   key, None, timeout, with_headers=True)
+    if status is None:
+        out["reason"] = f"网络不可达：{body[:60]}"
+        return out
+    if status == 401:
+        out["reason"] = "Key 无效或已失效"
+        return out
+    if status == 403:
+        out["reason"] = "Key 有效，但无权限访问模型列表"
+        out["ok"] = True
+    elif status == 200:
+        out["ok"] = True
+    else:
+        out["reason"] = f"HTTP {status}"
+
+    # 2) 先从响应头找（部分中转站在这里放到期时间）
+    for h in ("x-key-expires-at", "x-api-key-expires-at", "x-key-expire",
+              "x-token-expires-at", "expires-at"):
+        dt = _parse_ts(hdrs.get(h))
+        if dt:
+            out["expires"] = dt
+            break
+
+    # 3) 再从返回体里找到期/配额字段
+    try:
+        obj = json.loads(body)
+    except Exception:
+        obj = {}
+    for path in (("expires_at",), ("expire_at",), ("expiry",), ("expired_at",),
+                 ("data", "expires_at"), ("data", "expire_at"), ("data", "expiry"),
+                 ("account", "expires_at"), ("user", "expires_at")):
+        cur = obj
+        for k in path:
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                cur = None
+                break
+        if cur:
+            dt = _parse_ts(cur)
+            if dt:
+                out["expires"] = dt
+                break
+
+    # 3) 配额类字段
+    for path, label in ((("data", "quota"), "总额度"),
+                        (("data", "used_quota"), "已用额度"),
+                        (("data", "remaining"), "剩余额度"),
+                        (("quota",), "总额度"),
+                        (("remaining",), "剩余额度")):
+        cur = obj
+        for k in path:
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                cur = None
+                break
+        if isinstance(cur, (int, float)):
+            out["limits"].append(f"{label}：{cur:,.2f}")
+
+    if not out["expires"]:
+        out["note"] = ("OpenAI 兼容协议没有 Key 到期字段，"
+                       "多数服务商需在控制台查看有效期")
+    return out
+
+
 BALANCE_RULES = [
     ("api.deepseek.com", "https://api.deepseek.com/user/balance", "deepseek"),
     ("api.moonshot.cn", "https://api.moonshot.cn/v1/users/me/balance", "moonshot"),
@@ -845,7 +968,8 @@ def query_balance(base, key, timeout=8):
             if isinstance(d, dict) and d.get("total_available") is not None:
                 return ("中转站",
                         [f"剩余额度：{_fmt_num(d.get('total_available'))}",
-                         f"总额度：{_fmt_num(d.get('total_granted'))} ｜ 已用：{_fmt_num(d.get('total_used'))}",
+                         f"总额度：{_fmt_num(d.get('total_granted'))} ｜ 已用："
+                         f"{_fmt_num(d.get('total_used')) if d.get('total_used') is not None else '—'}",
                          f"接口：{path}"], url)
             rows = [(k2, v) for k2, v in _flatten(obj) if isinstance(v, (int, float))]
             if rows:
@@ -855,12 +979,66 @@ def query_balance(base, key, timeout=8):
                        "可到服务商控制台查看，或在中转站后台查看令牌额度"], "")
 
 
+def _pick_asset(release):
+    """从 release 里挑出 Windows exe 资产。"""
+    for a in release.get("assets") or []:
+        name = (a.get("name") or "").lower()
+        if name.endswith(".exe"):
+            return a.get("browser_download_url"), a.get("name"), a.get("size") or 0
+    return None, None, 0
+
+
+def download_update(url, dest, on_progress=None, timeout=30):
+    """下载更新包；on_progress(已下载, 总字节) 用于刷新进度条。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "ModelChecker"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        got = 0
+        with open(dest, "wb") as f:
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if on_progress:
+                    on_progress(got, total)
+    return got
+
+
+def make_swapper():
+    """生成一个自替换批处理：等本进程退出 → 覆盖 exe → 重新启动 → 自删。"""
+    exe = sys.executable if getattr(sys, "frozen", False) else sys.argv[0]
+    exe = os.path.abspath(exe)
+    new = exe + ".new"
+    bat = os.path.join(os.environ.get("TEMP") or os.path.expanduser("~"),
+                       "mc_update.bat")
+    # 用 ping 代替 timeout，兼容无控制台的窗口程序
+    script = (
+        "@echo off\r\n"
+        "setlocal\r\n"
+        "ping 127.0.0.1 -n 3 >nul\r\n"
+        ":wait\r\n"
+        f'move /y "{new}" "{exe}" >nul 2>&1\r\n'
+        f'if not exist "{new}" goto done\r\n'
+        "ping 127.0.0.1 -n 2 >nul\r\n"
+        "goto wait\r\n"
+        ":done\r\n"
+        f'start "" "{exe}" --updated-from=\"%OLDVER%\"\r\n'
+        'del "%~f0"\r\n'
+    )
+    with open(bat, "w", encoding="gbk", errors="replace") as f:
+        f.write(script)
+    return bat, new
+
+
 def parse_ver(v):
     nums = re.findall(r"\d+", v or "")
     return tuple(int(x) for x in nums[:3]) or (0,)
 
 
 def fetch_latest_release(timeout=8):
+    """返回 (tag, 页面地址, 更新说明, exe 下载地址)。"""
     url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
     req = urllib.request.Request(url, headers={
         "User-Agent": "ModelChecker",
@@ -868,7 +1046,12 @@ def fetch_latest_release(timeout=8):
     })
     with urllib.request.urlopen(req, timeout=timeout) as r:
         d = json.loads(r.read().decode("utf-8", "replace"))
-    return d.get("tag_name", ""), d.get("html_url", ""), d.get("body", "")
+    dl = None
+    for a in d.get("assets") or []:
+        if (a.get("name") or "").lower().endswith(".exe"):
+            dl = a.get("browser_download_url")
+            break
+    return d.get("tag_name", ""), d.get("html_url", ""), d.get("body", ""), dl
 
 
 def fetch_model_list(base, key, timeout=25):
@@ -926,10 +1109,20 @@ def fetch_prices(timeout=10):
             "ts": time.strftime("%H:%M")}
 
 
+_PRICE_CACHE = {}
+
+
 def price_data(model):
-    """返回 (输入价, 输出价) 人民币/百万 token，查不到返回 None。"""
+    """返回 (输入价, 输出价) 人民币/百万 token，查不到返回 None。
+
+    结果按模型名缓存：重绘时同一模型不再重复遍历价格表。
+    原实现每次调用都要遍历全部条目做前缀匹配，184 个模型 × 5 次重绘
+    会产生 ~94 万次 startswith，是缩放卡顿的主因。
+    """
     if not PRICES["by_id"]:
         return None
+    if model in _PRICE_CACHE:
+        return _PRICE_CACHE[model]
     k = norm_key(model)
     rec = PRICES["by_id"].get(k) or PRICES["by_name"].get(k)
     if rec is None:
@@ -940,9 +1133,9 @@ def price_data(model):
                     if best is None or len(cand) > len(best[0]):
                         best = (cand, v)
         rec = best[1] if best else None
-    if rec is None:
-        return None
-    return rec[0] * USD_RATE, rec[1] * USD_RATE
+    out = None if rec is None else (rec[0] * USD_RATE, rec[1] * USD_RATE)
+    _PRICE_CACHE[model] = out
+    return out
 
 
 def price_for(model):
@@ -967,25 +1160,63 @@ def carwash_pick():
     scene, tag = random.choice(CARWASH_SCENES)
     dist = random.choice(CARWASH_DIST)
     wx = random.choice(CARWASH_WEATHER)
-    q = (f"我想去洗车，洗车店离我家只有 {dist} 米{wx}，{scene}。"
+    q = (f"【离线作答要求】不要联网、不要调用搜索或任何外部工具，"
+         f"仅凭你自己的常识直接回答，不要复述题目。\n\n"
+         f"我想去洗车，洗车店离我家只有 {dist} 米{wx}，{scene}。"
          f"我应该开车过去还是走过去？请直接给结论，一句话说清理由。")
     return q, f"{dist} 米 · {tag}"
 
 
 def carwash_verdict(text):
-    """粗判回答：提到开车=对，只提走路=错。仅作彩蛋，不代表模型能力。"""
+    """判定洗车题。
+
+    通过的唯一条件：明确主张「应该/需要/必须开车」去洗车，且没有把走路说成更好。
+    其余情况（主张走路、说走路方便/不麻烦/更快、含糊两可）一律不通过或判为无结论。
+    仅作彩蛋，不代表模型能力。
+    """
     t = (text or "").strip()
-    low = t.lower()
-    drive = any(k in low for k in ("开车", "驾车", "开过去", "把车开", "drive"))
-    walk = any(k in low for k in ("走路", "步行", "走过去", "walk"))
-    if any(k in low for k in ("应该开车", "开车过去", "开车去", "把车开", "需要开车", "得开车", "drive the car")):
+    low = t.lower().replace(" ", "").replace("，", ",").replace("。", ".")
+
+    DRIVE = ("应该开车", "开车过去", "开车去", "把车开过去", "把车开去", "需要开车",
+             "必须开车", "得开车", "建议开车", "开车前往", "开车更", "开车比较",
+             "还是开车", "开车吧", "drive")
+    WALK = ("走路", "步行", "走过去", "走着去", "走过去", "walk")
+
+    # 这些短语出现时，说明模型在给「不开车」找理由 → 不通过
+    WALK_REASON = ("不麻烦", "不费事", "更方便", "比较方便", "很方便", "更省事",
+                   "省时", "更快", "更近", "不顺路", "停车麻烦", "不用开车",
+                   "不必开车", "没必要开车", "不必开", "不用开", "走两步",
+                   "走就行", "走过去就行", "走过去就可以", "步行即可", "不如走")
+    # 出现这些说明其实支持开车（否定走路）
+    DRIVE_REASON = ("不用走", "不必走", "不需要走", "无需走", "不用步行", "不必步行",
+                    "车没法洗", "车洗不了", "洗不了车", "没法洗车", "车怎么办",
+                    "车还停", "车在家", "车停在", "不如开车", "还是开车")
+
+    has_drive = any(k in low for k in DRIVE)
+    has_walk = any(k in low for k in WALK)
+    walk_reason = any(k in low for k in WALK_REASON)
+    drive_reason = any(k in low for k in DRIVE_REASON)
+
+    # 摇摆表达：既提开车又提走路且带「都行/也可以/都差不多」
+    if has_drive and has_walk and any(k in low for k in
+                                      ("都行", "都可以", "也行", "都差不多", "都可以的")):
+        return False, "结论摇摆：开车与走路都说了 🤔"
+
+    # 1) 明确主张开车，且没有给「走路更好」的理由 → 通过
+    if has_drive and not walk_reason:
         return True, "开窍了：要洗的是车 ✅"
-    if drive and not walk:
-        return True, "提到开车 ✅"
-    if drive and walk:
-        return True, "提到开车（也说了人走过去）"
-    if walk:
-        return False, "翻车了：让车主走路回家 🚶"
+    # 2) 有「不如开车 / 车没法洗」这类支持开车的表述 → 通过
+    if drive_reason and not walk_reason:
+        return True, "开窍了：要洗的是车 ✅"
+    # 3) 给了走路更方便/更快/不麻烦的理由 → 不通过
+    if walk_reason:
+        return False, "翻车了：建议走路去洗车 🚶"
+    # 4) 只主张走路，没提开车 → 不通过
+    if has_walk and not has_drive:
+        return False, "翻车了：建议走路去洗车 🚶"
+    # 5) 开车与走路都提了，观点两可 → 不通过
+    if has_drive and has_walk:
+        return False, "结论摇摆：开车与走路都说了 🤔"
     return None, "没给出明确结论 🤔"
 
 
@@ -993,7 +1224,9 @@ def ask_carwash(base, key, model, timeout=30):
     url = base.rstrip("/") + "/chat/completions"
     q, tag = carwash_pick()
     payload = {"model": model, "messages": [{"role": "user", "content": q}],
-               "max_tokens": 300, "temperature": 0.5}
+               "max_tokens": 300, "temperature": 0.5,
+               "tool_choice": "none", "tools": [],
+               "web_search_options": {"enable": False}}
     status, body, ms = http_json("POST", url, key, payload, timeout)
     if status != 200:
         return {"model": model, "ok": None, "text": f"HTTP {status}", "ms": ms,
@@ -1175,21 +1408,44 @@ def draw_chips(im, labels):
     return out, rects
 
 
-def fit_banner(img, w, h, plate_w=400, labels=None):
-    """铺满整条横幅（cover，实时跟随窗口宽度），不留任何白边。"""
+_PLATE_CACHE = {}
+
+
+def _plate(size_wh, pw, ph):
+    """生成（并缓存）标题底板 RGBA 图。尺寸不变时直接复用，省掉每帧合成。"""
+    key = (size_wh, pw, ph)
+    hit = _PLATE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ov = Image.new("RGBA", size_wh, (0, 0, 0, 0))
+    ImageDraw.Draw(ov).rounded_rectangle((16, 10, 16 + pw, 10 + ph), radius=18,
+                                         fill=(10, 15, 23, 165))
+    if len(_PLATE_CACHE) > 24:
+        _PLATE_CACHE.clear()
+    _PLATE_CACHE[key] = ov
+    return ov
+
+
+def fit_banner(img, w, h, plate_w=400, labels=None, fast=False):
+    """铺满整条横幅（cover）。
+
+    fast=True 时用双线性 + 跳过圆角底板合成，供拖动过程中使用（约 3ms）。
+    """
     ratio = max(w / img.width, h / img.height)
     nw, nh = max(w, int(img.width * ratio) + 1), max(h, int(img.height * ratio) + 1)
-    im = img.resize((nw, nh), Image.LANCZOS)
+    im = img.resize((nw, nh), Image.BILINEAR if fast else Image.LANCZOS)
     left = (nw - w) // 2
     top = 0 if nh > h else (nh - h) // 2       # 顶部对齐，优先保住人物头部
     im = im.crop((left, top, left + w, top + h))
 
-    # 标题底板：只在文字区域压暗，其余保持画面原样
     pw = max(180, min(plate_w, w - 32))
     ph = max(96, min(120, h - 18))
-    ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    ImageDraw.Draw(ov).rounded_rectangle((16, 10, 16 + pw, 10 + ph), radius=18,
-                                         fill=(10, 15, 23, 165))
+    if fast:
+        # 拖动中省略圆角底板，直接把标题压暗（省掉 alpha 合成，约 3ms）
+        box = im.crop((16, 10, 16 + pw, 10 + ph))
+        im.paste(Image.blend(box, Image.new("RGB", box.size, (10, 15, 23)), 0.65), (16, 10))
+        return im, []
+    ov = _plate((w, h), pw, ph)
     out = Image.alpha_composite(im.convert("RGBA"), ov).convert("RGB")
     return draw_chips(out, labels) if labels else (out, [])
 
@@ -1247,24 +1503,126 @@ class VScroll(tk.Frame):
 
 
 # ---------------------------------------------------------------- 小部件
-def center_on(win, parent):
-    """把弹窗放到父窗口中间。"""
+def ask_scope(app, picked_n, rest_n, total_n):
+    """检测范围三选一。返回 'picked' / 'rest' / 'all' / None(取消)。"""
+    from tkinter import ttk as _ttk
+    dlg = tk.Toplevel(app)
+    dlg.title("选择检测范围")
+    dlg.configure(bg=BG)
+    dlg.resizable(False, False)
+    dlg.transient(app)
+    dlg.grab_set()
+    f = app.f
+    dlg.result = None
+    var = tk.StringVar(value="picked")
+
+    tk.Label(dlg, text="要检测哪些模型？", bg=BG, fg=TEXT,
+             font=(f, 14, "bold")).pack(anchor="w", padx=24, pady=(20, 4))
+    tk.Label(dlg, text="检测到已有结果，请选择本次的范围", bg=BG, fg=MUTED,
+             font=(f, 9)).pack(anchor="w", padx=24)
+
+    box = tk.Frame(dlg, bg=BG)
+    box.pack(fill="x", padx=24, pady=(12, 0))
+    opts = [("picked", f"重测当前已选中模型（{picked_n} 个）", "只跑这次勾选的"),
+            ("rest", f"测试未选中模型（{rest_n} 个）", "跑上次结果里本次没勾选的"),
+            ("all", f"测试全部模型（{total_n} 个）", "重新拉取完整清单，全部重跑")]
+    for val, txt, tip in opts:
+        row = tk.Frame(box, bg=BG)
+        row.pack(fill="x", pady=4)
+        tk.Radiobutton(row, text=txt, variable=var, value=val, bg=BG, fg=TEXT,
+                       activebackground=BG, selectcolor=CARD, font=(f, 10),
+                       anchor="w", command=lambda v=val: var.set(v)).pack(side="left")
+        tk.Label(row, text=tip, bg=BG, fg=FAINT, font=(f, 8)).pack(side="left", padx=(8, 0))
+
+    foot = tk.Frame(dlg, bg=BG)
+    foot.pack(fill="x", padx=24, pady=(16, 18))
+
+    def ok():
+        dlg.result = var.get()
+        dlg.destroy()
+
+    _ttk.Button(foot, text="开始", style="Accent.TButton", width=10,
+                command=ok).pack(side="right")
+    _ttk.Button(foot, text="取消", style="Ghost.TButton", width=8,
+                command=dlg.destroy).pack(side="right", padx=(0, 8))
+    dlg.bind("<Return>", lambda e: ok())
+    dlg.bind("<Escape>", lambda e: dlg.destroy())
+    dlg.update_idletasks()
+    center_on(dlg, app)
+    dlg.after(30, lambda: center_on(dlg, app))
+    app.wait_window(dlg)
+    return dlg.result
+
+
+def ask_choice(app, title, text, yes_label="是", no_label="否",
+               primary="no", width=520):
+    """两按钮确认框：默认把「否」放在左侧并高亮（更安全，也更好点）。"""
+    dlg = tk.Toplevel(app)
+    dlg.title(title)
+    dlg.configure(bg=BG)
+    dlg.resizable(False, False)
+    dlg.transient(app)
+    dlg.grab_set()
+    f = app.f
+    dlg.result = False
+
+    tk.Label(dlg, text=text, bg=BG, fg=TEXT, font=(f, 10), justify="left",
+             wraplength=width - 44, anchor="w").pack(anchor="w", padx=22, pady=(20, 16))
+
+    foot = tk.Frame(dlg, bg=BG)
+    foot.pack(fill="x", padx=22, pady=(0, 18))
+    # 先 pack 右侧的「是」，再把「否」放左侧并高亮
+    b_yes = ttk.Button(foot, text=yes_label, style="Ghost.TButton", width=12,
+                       command=lambda: (setattr(dlg, "result", True), dlg.destroy()))
+    b_yes.pack(side="right")
+    b_no = ttk.Button(foot, text=no_label, style="Accent.TButton", width=14,
+                      command=dlg.destroy)
+    b_no.pack(side="left")
+
+    if primary == "no":
+        b_no.focus_set()
+    else:
+        b_yes.focus_set()
+    dlg.bind("<Return>", lambda e: (b_no.invoke() if primary == "no" else b_yes.invoke()))
+    dlg.bind("<Escape>", lambda e: dlg.destroy())
+    # 先真实渲染一次，拿到准确尺寸再居中（否则量到的是 1x1）
+    dlg.update_idletasks()
+    center_on(dlg, app)
+    dlg.after(30, lambda: center_on(dlg, app))
+    app.wait_window(dlg)
+    return dlg.result
+
+
+def center_on(win, parent=None):
+    """把弹窗放到父窗口正中；父窗口尺寸不可信时退回屏幕居中。"""
     try:
         win.update_idletasks()
-        pw, ph = parent.winfo_width(), parent.winfo_height()
-        px, py = parent.winfo_rootx(), parent.winfo_rooty()
         w, h = win.winfo_width(), win.winfo_height()
-        x = px + max(0, (pw - w) // 2)
-        y = py + max(0, (ph - h) // 3)
-        win.geometry(f"+{x}+{y}")
+        if w <= 1 or h <= 1:
+            w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        if parent is not None:
+            pw, ph = parent.winfo_width(), parent.winfo_height()
+            px, py = parent.winfo_rootx(), parent.winfo_rooty()
+            if pw > 200 and ph > 200:
+                x = px + max(0, (pw - w) // 2)
+                y = py + max(0, (ph - h) // 2)
+                # 确保不超出屏幕
+                sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+                x = max(0, min(x, sw - w - 8))
+                y = max(0, min(y, sh - h - 48))
+                win.geometry(f"+{x}+{y}")
+                return
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2 - 30)}")
     except Exception:
         pass
 
 
 class Toggle(tk.Frame):
-    def __init__(self, parent, text, variable, bg=CARD, font=None):
+    def __init__(self, parent, text, variable, bg=CARD, font=None, on_change=None):
         super().__init__(parent, bg=bg)
         self.var = variable
+        self.on_change = on_change
         self.canvas = tk.Canvas(self, width=38, height=20, bg=bg, highlightthickness=0, cursor="hand2")
         self.canvas.pack(side="left", pady=1)
         self.label = tk.Label(self, text=text, bg=bg, fg=TEXT, font=font or ("Segoe UI", 9), cursor="hand2")
@@ -1275,7 +1633,12 @@ class Toggle(tk.Frame):
         self._render()
 
     def _toggle(self, _=None):
-        self.var.set(not self.var.get())
+        want = not self.var.get()
+        if self.on_change is not None:
+            # 回调返回 False 表示放弃本次切换
+            if self.on_change(want) is False:
+                return
+        self.var.set(want)
 
     def _render(self):
         c = self.canvas
@@ -1306,12 +1669,18 @@ class Hero(tk.Canvas):
         super().__init__(parent, height=height, highlightthickness=0, bd=0, bg=BG)
         self.app = app
         self._img = None
+        self._canvas_img = None
+        self._last_w = 0
         self._job = None
         self._busy = False
         self._chips = []
+        self._pill_box = None
+        self._tip = None
+        self._tip_job = None
         self.bind("<Configure>", self._on_resize)
         self.bind("<Button-1>", self._on_click)
         self.bind("<Motion>", self._on_motion)
+        self.bind("<Leave>", lambda e: self._hide_tip())
 
     def _hit(self, x, y):
         for x1, y1, x2, y2, key in getattr(self, "_chips", []):
@@ -1324,6 +1693,55 @@ class Hero(tk.Canvas):
             self.configure(cursor="hand2" if self._hit(e.x, e.y) else "")
         except Exception:
             pass
+        # 绿色 pill 悬停：停留 350ms 后弹出安全说明
+        box = getattr(self, "_pill_box", None)
+        inside = bool(box) and box[0] <= e.x <= box[2] and box[1] <= e.y <= box[3]
+        if inside:
+            if self._tip is None and self._tip_job is None:
+                self._tip_job = self.after(350, lambda: self._show_tip(e.x, e.y))
+        else:
+            if self._tip_job is not None:
+                try:
+                    self.after_cancel(self._tip_job)
+                except Exception:
+                    pass
+                self._tip_job = None
+            self._hide_tip()
+
+    def _show_tip(self, x, y):
+        self._tip_job = None
+        if self._tip is not None:
+            return
+        text = ("API Key 只保存在本机内存，关闭程序即清除\n"
+                "配置文件不写入 Key，仅记接口地址等设置\n"
+                "只有三个出网地址：你填的接口、公开价格表、GitHub\n"
+                "无遥测 · 无上报 · 崩溃日志自动打码\n"
+                "点「关于 → 隐私与安全说明」可查看全文")
+        tip = tk.Toplevel(self)
+        tip.wm_overrideredirect(True)
+        tip.configure(bg=BORDER)
+        frame = tk.Frame(tip, bg=CARD, padx=12, pady=9)
+        frame.pack(padx=1, pady=1)
+        tk.Label(frame, text="🔐 安全设计", bg=CARD, fg=TEXT,
+                 font=(self.app.f, 9, "bold"), anchor="w").pack(anchor="w")
+        tk.Label(frame, text=text, bg=CARD, fg=MUTED, font=(self.app.f, 8),
+                 justify="left", anchor="w").pack(anchor="w", pady=(3, 0))
+        tip.update_idletasks()
+        tx = self.winfo_rootx() + x + 12
+        ty = self.winfo_rooty() + y + 14
+        sw, sh = tip.winfo_screenwidth(), tip.winfo_screenheight()
+        tw, th = tip.winfo_width(), tip.winfo_height()
+        tip.geometry(f"+{max(0, min(tx, sw - tw - 8))}+{max(0, min(ty, sh - th - 40))}")
+        self._tip = tip
+
+    def _hide_tip(self):
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+        self.configure(cursor="")
 
     def _on_click(self, e):
         key = self._hit(e.x, e.y)
@@ -1337,24 +1755,30 @@ class Hero(tk.Canvas):
     def _on_resize(self, _=None):
         if self._busy:
             return
-        # 拖动窗口时只重置计时器，停手后再重绘一次
+        if self.winfo_width() < 60:
+            return
+        # 拖动中立即用快速路径出一帧（约 4ms），避免露出未绘制的黑块
+        self.render(fast=True)
         if self._job:
             try:
                 self.after_cancel(self._job)
             except Exception:
                 pass
-        self._job = self.after(140, self.render)
+        # 停手后再精修：LANCZOS 重采样 + 圆角底板 + 按钮胶囊
+        self._job = self.after(180, self.render)
 
-    def render(self):
+    def render(self, fast=False):
         if getattr(self, "_rendering", False):
             return
         self._rendering = True
+        self._fast_mode = fast
         try:
             self._render_once()
         finally:
             self._rendering = False
 
     def _render_once(self):
+        fast = getattr(self, "_fast_mode", False)
         w, h = self.winfo_width(), self.winfo_height()
         if w < 60:
             return
@@ -1377,29 +1801,41 @@ class Hero(tk.Canvas):
             labels = [("背景", "bg"),
                       ("日间模式" if self.app.dark else "夜间模式", "theme"),
                       ("关于", "about")]
-            pil, self._chips = fit_banner(card, w, h, plate_w, labels)
+            pil, chips = fit_banner(card, w, h, plate_w, labels, fast=fast)
+            if chips:                      # 快速路径不更新热区，保留旧值
+                self._chips = chips
             self._img = ImageTk.PhotoImage(pil)
+            self._last_w = w
         else:
             labels = [("背景", "bg"),
                       ("日间模式" if self.app.dark else "夜间模式", "theme"),
                       ("关于", "about")]
-            pil, self._chips = draw_chips(build_bg_image(w, h, self.app.dark), labels)
+            pil, chips = draw_chips(build_bg_image(w, h, self.app.dark), labels)
+            if chips:
+                self._chips = chips
             self._img = ImageTk.PhotoImage(pil)
         self.delete("all")
-        self.create_image(0, 0, image=self._img, anchor="nw")
+        self._canvas_img = self.create_image(0, 0, image=self._img, anchor="nw")
+        if fast:                     # 拖动时只换图，文字等停手后再画
+            return
         self.create_text(27, 27, anchor="nw", text="AI 模型可用性检测", fill="#0A1018", font=(f, 18, "bold"))
         self.create_text(26, 26, anchor="nw", text="AI 模型可用性检测", fill="#FFFFFF", font=(f, 18, "bold"))
         self.create_text(27, 64, anchor="nw", fill="#0A1018", font=(f, 10),
                          text="连通性 · 模型真实性 · 延迟 · 能力")
         self.create_text(26, 63, anchor="nw", fill="#FFFFFF", font=(f, 10),
                          text="连通性 · 模型真实性 · 延迟 · 能力")
-        # 绿色安全标识
+        # 绿色安全标识（可悬停查看安全说明）
         pill = "本地运行 · 密钥不上传"
         pf = tkfont.Font(family=f, size=9)
         pw = pf.measure(pill) + 28
+        self._pill_box = (26, 88, 26 + pw, 114)
+        self._pill_tag = f"pill{id(self)}"
         self.create_polygon(*self._pill_pts(26, 88, 26 + pw, 114, 13), smooth=True,
-                            fill=GREEN_BG, outline=GREEN_BG)
-        self.create_text(26 + pw / 2, 101, text=pill, fill=GREEN, font=(f, 9), anchor="center")
+                            fill=GREEN_BG, outline=GREEN_BG, tags=(self._pill_tag,))
+        self.create_text(26 + pw / 2, 101 + 1, text=pill, fill="#064E3B", font=(f, 9),
+                         anchor="center", tags=(self._pill_tag,))
+        self.create_text(26 + pw / 2, 101, text=pill, fill=GREEN, font=(f, 9),
+                         anchor="center", tags=(self._pill_tag,))
 
         self.create_text(w - 18, h - 10, anchor="se", text=f"v{APP_VER}", fill="#E6EDF6", font=(f, 8))
 
@@ -1430,7 +1866,7 @@ class ModelPicker(tk.Toplevel):
         head.pack(fill="x", padx=18, pady=(16, 8))
         tk.Label(head, text=f"共 {len(self.models)} 个模型", bg=BG, fg=TEXT,
                  font=(self.f, 12, "bold")).pack(anchor="w")
-        tk.Label(head, text="Ctrl / Shift 多选，双击单条切换；搜索框支持模糊筛选", bg=BG, fg=MUTED,
+        tk.Label(head, text="双击单条可选中 / 取消，Ctrl / Shift 可多选；搜索框支持模糊筛选", bg=BG, fg=MUTED,
                  font=(self.f, 9)).pack(anchor="w", pady=(2, 0))
 
         box = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
@@ -1519,13 +1955,15 @@ class ModelPicker(tk.Toplevel):
     def _toggle_at(self, event):
         i = self.lb.nearest(event.y)
         if i < 0 or i >= len(self._visible):
-            return
+            return "break"
         m = self._visible[i]
         if m in self.picked:
             self.picked.discard(m)
         else:
             self.picked.add(m)
         self._refill(sync=False)
+        # 阻止 Listbox 默认的双击选择行为（否则会覆盖 toggle 的结果）
+        return "break"
 
     def _ok(self):
         self._sync_picked()
@@ -1707,61 +2145,218 @@ class CardPicker(tk.Toplevel):
         self.destroy()
 
 
-class EggDialog(tk.Toplevel):
-    """检测完成后的小彩蛋：洗车陷阱题。"""
+class EggPickDialog(tk.Toplevel):
+    """开始前选择范围：随机 3 个 / 全部已连通模型。"""
 
-    def __init__(self, app, rows):
+    def __init__(self, app, total):
+        super().__init__(app)
+        self.app = app
+        self.title("彩蛋")
+        self.configure(bg=BG)
+        self.geometry("420x230")
+        self.resizable(False, False)
+        self.transient(app)
+        self.grab_set()
+        self.confirmed = False
+        self.scope = "random"
+        f = app.f
+
+        tk.Label(self, text="🥚 洗车陷阱题", bg=BG, fg=TEXT,
+                 font=(f, 14, "bold")).pack(anchor="w", padx=22, pady=(18, 4))
+        tk.Label(self, text=f"已连通 {total} 个对话模型，选择这次测谁：",
+                 bg=BG, fg=MUTED, font=(f, 9)).pack(anchor="w", padx=22)
+
+        box = tk.Frame(self, bg=BG)
+        box.pack(fill="x", padx=22, pady=(12, 0))
+        self.var = tk.StringVar(value="random")
+        for val, txt, tip in (("random", "随机 3 个", "每次换人，适合反复玩"),
+                              ("all", f"全部 {total} 个", "一次跑完，耗时更久")):
+            row = tk.Frame(box, bg=BG)
+            row.pack(fill="x", pady=3)
+            tk.Radiobutton(row, text=txt, variable=self.var, value=val, bg=BG, fg=TEXT,
+                           activebackground=BG, selectcolor=CARD, font=(f, 10),
+                           command=lambda v=val: self.var.set(v)).pack(side="left")
+            tk.Label(row, text=tip, bg=BG, fg=FAINT, font=(f, 8)).pack(side="left", padx=(8, 0))
+
+        foot = tk.Frame(self, bg=BG)
+        foot.pack(fill="x", side="bottom", padx=22, pady=(0, 16))
+        ttk.Button(foot, text="取消", style="Ghost.TButton", width=8,
+                   command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(foot, text="开始", style="Primary.TButton", width=8,
+                   command=self._ok).pack(side="right")
+        self.after(10, lambda: center_on(self, app))
+
+    def _ok(self):
+        self.confirmed = True
+        self.scope = self.var.get()
+        self.destroy()
+
+
+class EggDialog(tk.Toplevel):
+    """彩蛋窗口：先弹出，边测边显示进度；列表可滚动，当前项绿色高亮。"""
+
+    def __init__(self, app, rows, total=0, pending=None):
         super().__init__(app)
         self.app = app
         self.title("彩蛋：洗车陷阱题")
         self.configure(bg=BG)
-        self.geometry("660x460")
+        self.geometry("700x540")
+        self.minsize(620, 420)
         self.transient(app)
         f = app.f
+        self._rows = []
+        self._cards = []
+        self._total = total
+        self._pending = list(pending or [])
 
         head = tk.Frame(self, bg=BG)
         head.pack(fill="x", padx=22, pady=(18, 4))
-        tk.Label(head, text="🥚 彩蛋：洗车陷阱题 🚗💦", bg=BG, fg=TEXT, font=(f, 14, "bold")).pack(anchor="w")
+        tk.Label(head, text="🥚 彩蛋：洗车陷阱题 🚗💦", bg=BG, fg=TEXT,
+                 font=(f, 14, "bold")).pack(anchor="w")
         tk.Label(head, text="🚿 洗车店 30–300 米随机 · 场景随机，防背答案——要洗的是车，不是人。",
                  bg=BG, fg=MUTED, font=(f, 9)).pack(anchor="w", pady=(3, 0))
-        tk.Label(head, text="🎲 随机抽 3 个已连通模型，各自随机题目 · 仅图一乐，不代表模型能力",
-                 bg=BG, fg=FAINT, font=(f, 8)).pack(anchor="w", pady=(2, 0))
+        self.lbl_sub = tk.Label(head, text="🔌 已要求模型离线作答，禁用联网与工具 · 仅图一乐",
+                                bg=BG, fg=FAINT, font=(f, 8))
+        self.lbl_sub.pack(anchor="w", pady=(2, 0))
 
-        body = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-        body.pack(fill="both", expand=True, padx=22, pady=(10, 8))
-        for i, r in enumerate(rows):
-            card = tk.Frame(body, bg=CARD)
-            card.pack(fill="x", padx=12, pady=(10 if i == 0 else 6, 0))
-            ok = r.get("ok")
-            sym, color = ("🎉", GREEN) if ok else (("💤", RED) if ok is False else ("🤔", MUTED))
-            tk.Label(card, text=sym, bg=CARD, fg=color, font=(f, 11), width=3).pack(side="left", anchor="n")
-            right = tk.Frame(card, bg=CARD)
-            right.pack(side="left", fill="x", expand=True)
-            tk.Label(right, text=r.get("model", ""), bg=CARD, fg=TEXT,
-                     font=(f, 10, "bold")).pack(anchor="w")
-            why = r.get("why") or ""
-            if r.get("tag"):
-                why = f"[{r['tag']}] " + why
-            if r.get("ms"):
-                why += f" · {r['ms']} ms"
-            tk.Label(right, text=why, bg=CARD, fg=color if ok is not None else MUTED,
-                     font=(f, 8)).pack(anchor="w")
-            snippet = (r.get("text") or "").replace("\n", " ").strip()
-            if len(snippet) > 90:
-                snippet = snippet[:90] + "…"
-            tk.Label(right, text=snippet or "（无内容）", bg=CARD, fg=MUTED, font=(f, 9),
-                     wraplength=540, justify="left").pack(anchor="w", pady=(2, 0))
+        self.prog = ttk.Progressbar(self, mode="determinate", maximum=max(1, total or 1), value=0)
+        self.prog.pack(fill="x", padx=22, pady=(8, 0))
+        self.lbl_pg = tk.Label(self, text=f"0 / {total}" if total else "",
+                               bg=BG, fg=MUTED, font=(f, 8))
+        self.lbl_pg.pack(anchor="e", padx=22)
 
         foot = tk.Frame(self, bg=BG)
         foot.pack(fill="x", side="bottom", padx=22, pady=(0, 14))
         tk.Label(foot, text="仅对已连通模型生效 · 仅图一乐", bg=BG, fg=FAINT,
                  font=(f, 8)).pack(side="left")
-        ttk.Button(foot, text="再来一次", style="Ghost.TButton", width=9,
-                   command=self._again).pack(side="right", padx=(0, 8))
-        ttk.Button(foot, text="关闭", style="Primary.TButton", width=8,
+        self.btn_again = ttk.Button(foot, text="再来一次", style="Accent.TButton", width=10,
+                                    command=self._again)
+        self.btn_again.pack(side="right", padx=(0, 8))
+        self.btn_pause = ttk.Button(foot, text="暂停", style="Ghost.TButton", width=8,
+                                    command=self._toggle_pause)
+        self.btn_pause.pack(side="right", padx=(0, 8))
+        ttk.Button(foot, text="关闭", style="Ghost.TButton", width=8,
                    command=self.destroy).pack(side="right")
         self.bind("<Escape>", lambda e: self.destroy())
+
+        # 可滚动的结果区
+        outer = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        outer.pack(fill="both", expand=True, padx=22, pady=(8, 8))
+        self.scroller = VScroll(outer, bg=CARD)
+        self.scroller.pack(fill="both", expand=True)
+        self.body = self.scroller.inner
+
+        self.hint = tk.Label(self.body, text="⏳ 正在提问…", bg=CARD, fg=MUTED, font=(f, 10))
+        self.hint.pack(pady=40)
+
+        # 先把待测模型全部列出来（首个绿色「测试中」，其余灰色「排队中」）
+        for m in self._pending:
+            self._make_card(m, "排队中…", FAINT)
+        for r in rows or []:
+            self.add_row(r)
+        self._refresh_states()
         self.after(10, lambda: center_on(self, app))
+
+    # ---------- 行
+    def _make_card(self, model, status_text, color):
+        f = self.app.f
+        card = tk.Frame(self.body, bg=CARD)
+        card.pack(fill="x", padx=12, pady=(10, 0))
+        top = tk.Frame(card, bg=CARD)
+        top.pack(fill="x")
+        dot = tk.Label(top, text="●", bg=CARD, fg=color, font=(f, 9))
+        dot.pack(side="left", padx=(0, 6))
+        name = tk.Label(top, text=model, bg=CARD, fg=color, font=(f, 10, "bold"))
+        name.pack(side="left")
+        tail = tk.Label(top, text=status_text, bg=CARD, fg=color, font=(f, 8))
+        tail.pack(side="left", padx=(8, 0))
+        kids = tk.Frame(card, bg=CARD)
+        kids.pack(fill="x", padx=(14, 0))
+        self._cards.append({"frame": card, "name": name, "dot": dot,
+                            "tail": tail, "kids": kids, "model": model,
+                            "state": "pending"})
+        return card
+
+    def set_pending(self, models):
+        """预先把待测模型列出来，当前正在测的显示绿色。"""
+        self._pending = list(models)
+        for m in self._pending:
+            if any(c["model"] == m and c.get("state") != "pending" for c in self._cards):
+                continue
+            if any(c["model"] == m for c in self._cards):
+                continue
+            self._make_card(m, "测试中…", GREEN)
+        self._refresh_states()
+
+    def _refresh_states(self):
+        """只有最后一个未完成项是绿色「测试中」，其余已完成项转灰。"""
+        live = None
+        for c in self._cards:
+            if c.get("state") == "pending" and live is None:
+                live = c
+        for c in self._cards:
+            if c.get("state") == "done":
+                c["dot"].configure(fg=FAINT)
+                c["name"].configure(fg=FAINT)
+                c["tail"].configure(fg=FAINT, text="已完成")
+            elif c is live:
+                c["dot"].configure(fg=GREEN)
+                c["name"].configure(fg=GREEN)
+                c["tail"].configure(fg=GREEN, text="测试中…")
+            else:
+                c["dot"].configure(fg=FAINT)
+                c["name"].configure(fg=FAINT)
+                c["tail"].configure(fg=FAINT, text="排队中…")
+
+    def add_row(self, r):
+        """追加一条结果，并更新进度。"""
+        if self.hint.winfo_exists():
+            self.hint.destroy()
+        f = self.app.f
+        model = r.get("model", "")
+        # 找到预建的占位卡片
+        card_meta = next((c for c in self._cards
+                          if c["model"] == model and c.get("state") == "pending"), None)
+        if card_meta is None:
+            self._make_card(model, "", MUTED)
+            card_meta = self._cards[-1]
+
+        ok = r.get("ok")
+        color = GREEN if ok else (RED if ok is False else MUTED)
+        sym = "🎉" if ok else ("💤" if ok is False else "🤔")
+        why = r.get("why") or ""
+        if r.get("tag"):
+            why = f"[{r['tag']}] " + why
+        if r.get("ms"):
+            why += f" · {int(r['ms'])} ms"
+        tk.Label(card_meta["kids"], text=f"{sym} {why}", bg=CARD, fg=color,
+                 font=(f, 9)).pack(anchor="w")
+        snippet = (r.get("text") or "").replace("\n", " ").strip()
+        if len(snippet) > 130:
+            snippet = snippet[:130] + "…"
+        tk.Label(card_meta["kids"], text=snippet or "（无内容）", bg=CARD, fg=MUTED,
+                 font=(f, 9), wraplength=580, justify="left").pack(anchor="w", pady=(2, 0))
+        card_meta["state"] = "done"
+        self._rows.append(r)
+        self._refresh_states()
+
+        n = len(self._rows)
+        self.prog.configure(value=n)
+        self.lbl_pg.configure(text=f"{n} / {self._total}" if self._total else str(n))
+        if self._total and n >= self._total:
+            self.btn_again.state(["!disabled"])
+            self.lbl_sub.configure(text="✅ 本轮完成 · 仅图一乐，不代表模型能力")
+
+    def _toggle_pause(self):
+        app = self.app
+        if getattr(app, "_egg_paused", False):
+            app._egg_paused = False
+            self.btn_pause.configure(text="暂停")
+            self.lbl_sub.configure(text="▶ 已继续 · 已要求模型离线作答")
+        else:
+            app._egg_paused = True
+            self.btn_pause.configure(text="继续")
+            self.lbl_sub.configure(text="⏸ 已暂停 · 当前请求完成后停止后续")
 
     def _again(self):
         self.destroy()
@@ -1774,7 +2369,7 @@ class BalanceDialog(tk.Toplevel):
     def __init__(self, app):
         super().__init__(app)
         self.app = app
-        self.title("余额查询")
+        self.title("Key 状态与余额")
         self.configure(bg=BG)
         self.geometry("560x340")
         self.transient(app)
@@ -1812,12 +2407,35 @@ class BalanceDialog(tk.Toplevel):
         self.txt.insert("1.0", "正在请求服务商接口…")
         self.txt.configure(state="disabled")
         self.update_idletasks()
-        prov, lines, url = query_balance(self.app.url_var.get(), self.app.key_var.get().strip())
+
+        base = self.app.url_var.get()
+        key = self.app.key_var.get().strip()
+        prov, lines, url = query_balance(base, key)
+        st = query_key_status(base, key)
+
+        rows = []
+        # Key 状态
+        if st["ok"]:
+            rows.append("✅ Key 有效")
+        elif st["reason"]:
+            rows.append(f"❌ {st['reason']}")
+        if st["expires"]:
+            left = (st["expires"] - datetime.datetime.now()).days
+            tag = f"（还剩 {left} 天）" if left >= 0 else "（已过期）"
+            rows.append(f"到期时间：{st['expires']:%Y-%m-%d %H:%M} {tag}")
+        elif st.get("note"):
+            rows.append(f"到期时间：{st['note']}")
+        for x in st["limits"]:
+            rows.append(x)
+        rows.append("")
+        rows.append(f"—— 余额（{prov}）——")
+        rows.extend(lines)
+
         self.lbl_title.configure(text=prov)
         self.lbl_ep.configure(text=url or "未调用外部接口")
         self.txt.configure(state="normal")
         self.txt.delete("1.0", "end")
-        self.txt.insert("1.0", "\n".join(lines))
+        self.txt.insert("1.0", "\n".join(rows))
         self.txt.configure(state="disabled")
 
 
@@ -1955,7 +2573,7 @@ class AboutDialog(tk.Toplevel):
         self.status.configure(text="正在检查最新版本…", fg=MUTED)
         self.update_idletasks()
         try:
-            tag, url, _ = fetch_latest_release()
+            tag, url, _, dl = fetch_latest_release()
         except urllib.error.HTTPError as e:
             self.status.configure(text="还没有发布版本" if e.code == 404 else f"检查失败：HTTP {e.code}", fg=RED)
             return
@@ -1967,8 +2585,9 @@ class AboutDialog(tk.Toplevel):
             return
         if parse_ver(tag) > parse_ver(APP_VER):
             self.status.configure(text=f"发现新版本 {tag}", fg=GREEN)
-            if messagebox.askyesno(APP_NAME, f"发现新版本 {tag}，是否打开下载页？"):
-                webbrowser.open(url)
+            if messagebox.askyesno(APP_NAME, f"发现新版本 {tag}，是否立即更新？"):
+                self.app._update_dl = dl
+                self.app._start_update(dl) if dl else webbrowser.open(url)
         else:
             self.status.configure(text=f"已是最新版本（{tag}）", fg=GREEN)
 
@@ -1980,7 +2599,7 @@ class App(tk.Tk):
         self.title(f"AI 模型可用性检测 v{APP_VER}")
         self.configure(bg=BG)
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"{min(1280, sw - 80)}x{min(940, sh - 80)}")
+        self.geometry(f"{min(1400, sw - 60)}x{min(950, sh - 60)}")
         self.minsize(1100, 760)
         self.q = queue.Queue()
         self.stop_event = threading.Event()
@@ -1995,8 +2614,15 @@ class App(tk.Tk):
         self.done_count = 0
         self._closing = False
         self._fit_job = None
+        self._fit_cache = {}
+        self._row_job = None
+        self._egg_seen = set()
+        self._egg_dlg = None
+        self._update_dl = None
+        self._live_opts = None
         self._running = False
         self._max_model_px = 0
+        self._measured_count = -1
         self._rows_job = None
         self._resizing = False
         self._keybad_shown = False
@@ -2015,9 +2641,10 @@ class App(tk.Tk):
         self.after(100, self._drain)
         self.after(60, lambda: self.hero.render())
         threading.Thread(target=self._load_prices, daemon=True).start()
-        self.after(3000, self._silent_update_check)
+        self.after(1500, self._silent_update_check)
         if not skip_agreement:
             self.after(250, self._ask_agreement)
+        self.after(900, self._maybe_show_updated)
         ico = resource_path("app.ico")
         if os.path.exists(ico):
             try:
@@ -2042,6 +2669,10 @@ class App(tk.Tk):
                      focusthickness=0, padding=(14, 8), font=(f, 10, "bold"))
         st.map("Primary.TButton", background=[("active", ACCENT_DARK), ("disabled", DISABLED)],
                foreground=[("disabled", "#EEF1F6")])
+        st.configure("Accent.TButton", background=ACCENT, foreground="#FFFFFF", borderwidth=0,
+                     focusthickness=0, padding=(10, 7), font=(f, 9, "bold"))
+        st.map("Accent.TButton", background=[("active", ACCENT_DARK), ("disabled", DISABLED)],
+               foreground=[("disabled", "#EEF1F6")])
         st.configure("Ghost.TButton", background=CARD, foreground=TEXT, borderwidth=1,
                      bordercolor=BORDER, focusthickness=0, padding=(10, 7), font=(f, 9))
         st.map("Ghost.TButton", background=[("active", CHIP_HOVER), ("disabled", HEAD_BG)],
@@ -2052,8 +2683,13 @@ class App(tk.Tk):
                      relief="flat", borderwidth=0, font=(f, 9, "bold"), padding=(6, 8))
         st.map("Treeview.Heading", background=[("active", CHIP_HOVER)])
         st.map("Treeview", background=[("selected", SEL_BG)], foreground=[("selected", TEXT)])
-        st.configure("TProgressbar", background=ACCENT, troughcolor=TROUGH, borderwidth=0,
-                     bordercolor=TROUGH, lightcolor=ACCENT, darkcolor=ACCENT, thickness=8)
+        st.configure("TProgressbar", background="#22C55E", troughcolor=TROUGH, borderwidth=0,
+                     bordercolor="#22C55E", lightcolor="#22C55E", darkcolor="#22C55E",
+                     thickness=8)
+        # 更新下载用的绿色进度条
+        st.configure("Green.Horizontal.TProgressbar", background="#16A34A",
+                     troughcolor=TROUGH, borderwidth=0, bordercolor=TROUGH,
+                     lightcolor="#16A34A", darkcolor="#16A34A", thickness=14)
 
     def _card(self, parent, pad=12):
         outer = tk.Frame(parent, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
@@ -2073,7 +2709,7 @@ class App(tk.Tk):
 
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=22, pady=(8, 0))
-        body.columnconfigure(0, minsize=352)
+        body.columnconfigure(0, minsize=340)
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
 
@@ -2116,7 +2752,7 @@ class App(tk.Tk):
         self.show_key = tk.BooleanVar(value=False)
         Toggle(row, "显示", self.show_key, bg=CARD, font=(f, 9)).pack(side="left", padx=(8, 0))
         self.show_key.trace_add("write", lambda *a: self.ent_key.configure(show="" if self.show_key.get() else "*"))
-        sec = tk.Label(b, text="密钥只存在本机内存 · 隐私与安全说明 →", bg=CARD, fg=ACCENT,
+        sec = tk.Label(b, text="密钥只存在本机内存，退出软件即失效 · 隐私与安全说明 →", bg=CARD, fg=ACCENT,
                        font=(f, 8), cursor="hand2")
         sec.pack(anchor="w", pady=(5, 0))
         sec.bind("<Button-1>", lambda e: self.show_privacy())
@@ -2137,17 +2773,21 @@ class App(tk.Tk):
         self.opt_tools = tk.BooleanVar(value=False)
         self.opt_think = tk.BooleanVar(value=True)
         self.opt_egg = tk.BooleanVar(value=True)
+        self.opt_update = tk.BooleanVar(value=True)
         self.opt_tokenwin = tk.BooleanVar(value=True)
         Toggle(b2, "流式响应（SSE，多 1 次请求）", self.opt_stream, bg=CARD, font=(f, 9)).pack(anchor="w", pady=(7, 0))
         Toggle(b2, "工具调用 function call（多 1 次请求）", self.opt_tools, bg=CARD, font=(f, 9)).pack(anchor="w", pady=(6, 0))
-        Toggle(b2, "思考能力 reasoning（多 1 次请求，较慢）", self.opt_think, bg=CARD, font=(f, 9)).pack(anchor="w", pady=(6, 0))
+        self.tg_think = Toggle(b2, "思考能力 reasoning（关闭可提速 100 倍）",
+                               self.opt_think, bg=CARD, font=(f, 9),
+                               on_change=self._ask_think_change)
+        self.tg_think.pack(anchor="w", pady=(6, 0))
         tkrow = tk.Frame(b2, bg=CARD)
         tkrow.pack(fill="x", pady=(8, 0))
         tk.Label(tkrow, text="输出 token 数", bg=CARD, fg=MUTED, font=(f, 9)).pack(side="left")
         self.tokens_var = tk.StringVar(value="1")
         ttk.Spinbox(tkrow, from_=1, to=512, width=4, textvariable=self.tokens_var).pack(side="left", padx=(6, 6))
         tk.Label(tkrow, text="默认 1", bg=CARD, fg=FAINT, font=(f, 8)).pack(side="left")
-        Toggle(b2, "结束后弹出 Token 统计", self.opt_tokenwin, bg=CARD, font=(f, 9)).pack(anchor="w", pady=(7, 0))
+        Toggle(b2, "结束后弹出本次消耗 token 统计", self.opt_tokenwin, bg=CARD, font=(f, 9)).pack(anchor="w", pady=(7, 0))
 
         c3, b3 = self._card(col)
         c3.pack(fill="x", pady=(8, 0))
@@ -2229,18 +2869,18 @@ class App(tk.Tk):
         self.btn_tokwin = ttk.Button(bar2, text="Token 统计", style="Ghost.TButton", width=10,
                                      command=self.show_tokens, state="disabled")
         self.btn_tokwin.pack(side="right")
-        self.btn_balance = ttk.Button(bar2, text="余额查询", style="Ghost.TButton", width=9,
+        self.btn_balance = ttk.Button(bar2, text="到期时间/余额", style="Ghost.TButton", width=12,
                                       command=self.show_balance)
         self.btn_balance.pack(side="right", padx=6)
-        self.btn_onlyok = ttk.Button(bar2, text="只测可用", style="Ghost.TButton", width=11,
+        self.btn_onlyok = ttk.Button(bar2, text="重测可用", style="Ghost.TButton", width=11,
                                      command=self.retest_ok, state="disabled")
         self.btn_onlyok.pack(side="left")
-        self.btn_retryall = ttk.Button(bar2, text="全部重测", style="Ghost.TButton", width=11,
-                                       command=self.retest_all, state="disabled")
+        self.btn_retryall = ttk.Button(bar2, text="重测失败项", style="Ghost.TButton", width=12,
+                                       command=self.retry_failed, state="disabled")
         self.btn_retryall.pack(side="left", padx=6)
-        self.btn_retry = ttk.Button(bar2, text="重试失败项", style="Ghost.TButton", width=11,
-                                    command=self.retry_failed, state="disabled")
-        self.btn_retry.pack(side="left")
+        self.btn_clear = ttk.Button(bar2, text="一键清空", style="Ghost.TButton", width=10,
+                                    command=self.clear_all, state="disabled")
+        self.btn_clear.pack(side="left")
 
         tcard, tb = self._card(right, pad=1)
         tcard.pack(fill="both", expand=True)
@@ -2251,7 +2891,7 @@ class App(tk.Tk):
         for c, txt, w, anchor in (("status", "状态", 60, "w"), ("model", "模型", 140, "w"),
                                   ("spec", "上下文/输出", 90, "center"),
                                   ("latency", "延迟", 58, "e"), ("cap", "能力", 164, "w"),
-                                  ("detail", "说明", 168, "w"), ("price", "参考价格", 150, "e")):
+                                  ("detail", "说明", 168, "w"), ("price", "每百万 token", 156, "e")):
             self.table.heading(c, text=txt, anchor=anchor, command=lambda cc=c: self._sort(cc))
             self.table.column(c, width=w, anchor=anchor, stretch=False)
         vs = ttk.Scrollbar(wrap, orient="vertical", command=self.table.yview)
@@ -2331,6 +2971,99 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _start_update(self, url):
+        """软件内下载：绿色进度条 → 完成后自替换并重启。"""
+        dlg = tk.Toplevel(self)
+        dlg.title("正在更新")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        f = self.f
+        tk.Label(dlg, text="正在下载新版本…", bg=BG, fg=TEXT,
+                 font=(f, 13, "bold")).pack(anchor="w", padx=26, pady=(20, 4))
+        lbl = tk.Label(dlg, text="0%", bg=BG, fg=MUTED, font=(f, 9))
+        lbl.pack(anchor="w", padx=26)
+        bar = ttk.Progressbar(dlg, mode="determinate", maximum=100, value=0,
+                              style="Green.Horizontal.TProgressbar")
+        bar.pack(fill="x", padx=26, pady=(6, 4))
+        tip = tk.Label(dlg, text="下载完成后会自动重启，无需手动操作",
+                       bg=BG, fg=FAINT, font=(f, 8))
+        tip.pack(anchor="w", padx=26, pady=(0, 18))
+        dlg.update_idletasks()
+        center_on(dlg, self)
+
+        exe = os.path.abspath(sys.executable if getattr(sys, "frozen", False) else sys.argv[0])
+        dest = exe + ".new"
+        state = {"done": False, "err": ""}
+
+        def on_prog(got, total):
+            if total:
+                pct = min(100, int(got * 100 / total))
+                bar.configure(value=pct)
+                lbl.configure(text=f"{pct}%  ·  {got/1048576:.1f} / {total/1048576:.1f} MB")
+            else:
+                lbl.configure(text=f"{got/1048576:.1f} MB")
+
+        def work():
+            try:
+                download_update(url, dest, on_prog)
+                state["done"] = True
+            except Exception as e:
+                state["err"] = f"{type(e).__name__}: {e}"
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            if not dlg.winfo_exists():
+                return
+            if state["err"]:
+                lbl.configure(text=f"下载失败：{state['err']}", fg=RED)
+                tip.configure(text="可点「关于 → 检查更新」重试，或手动到 Releases 下载")
+                return
+            if state["done"]:
+                bar.configure(value=100)
+                lbl.configure(text="100%  ·  下载完成", fg=GREEN)
+                tip.configure(text="正在替换并重启…", fg=GREEN)
+                dlg.update_idletasks()
+                self.after(400, lambda: self._apply_update(dlg, exe, dest))
+                return
+            dlg.after(120, poll)
+
+        dlg.after(120, poll)
+
+    def _apply_update(self, dlg, exe, dest):
+        """退出前启动替换脚本。"""
+        try:
+            bat = os.path.join(os.environ.get("TEMP") or os.path.expanduser("~"),
+                               "mc_update.bat")
+            script = (
+                "@echo off\r\n"
+                "setlocal\r\n"
+                "ping 127.0.0.1 -n 3 >nul\r\n"
+                ":wait\r\n"
+                f'move /y "{dest}" "{exe}" >nul 2>&1\r\n'
+                f'if not exist "{dest}" goto done\r\n'
+                "ping 127.0.0.1 -n 2 >nul\r\n"
+                "goto wait\r\n"
+                ":done\r\n"
+                f'start "" "{exe}" --updated {APP_VER}\r\n'
+                'del "%~f0"\r\n'
+            )
+            with open(bat, "w", encoding="gbk", errors="replace") as fp:
+                fp.write(script)
+            subprocess.Popen(["cmd", "/c", bat], shell=False,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"无法启动更新程序：{e}\n\n请手动下载替换。")
+            return
+        try:
+            dlg.destroy()
+        except Exception:
+            pass
+        self._closing = True
+        self.after(200, self._on_close)
+
     def show_privacy(self):
         dlg = PrivacyDialog(self)
         self.wait_window(dlg)
@@ -2342,12 +3075,79 @@ class App(tk.Tk):
     def _silent_update_check(self):
         def work():
             try:
-                tag, url, _ = fetch_latest_release(6)
-                self.q.put(("update", tag, url))
+                tag, url, _, dl = fetch_latest_release(6)
+                self.q.put(("update", tag, url, dl))
             except Exception:
                 pass
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _show_update(self, tag, url):
+        """三选项：更新 / 下次再说 / 以后不再提醒。"""
+        dlg = tk.Toplevel(self)
+        dlg.title("发现新版本")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        f = self.f
+        tk.Label(dlg, text=f"发现新版本 {tag}", bg=BG, fg=TEXT,
+                 font=(f, 15, "bold")).pack(anchor="w", padx=24, pady=(20, 6))
+        tk.Label(dlg, text=f"当前版本 v{APP_VER}。新版本通常包含功能改进与问题修复。",
+                 bg=BG, fg=MUTED, font=(f, 9)).pack(anchor="w", padx=24)
+        tk.Label(dlg, text=url, bg=BG, fg=ACCENT, font=(f, 8),
+                 wraplength=420, justify="left").pack(anchor="w", padx=24, pady=(6, 0))
+
+        foot = tk.Frame(dlg, bg=BG)
+        foot.pack(fill="x", padx=24, pady=(16, 18))
+
+        def later():
+            dlg.destroy()
+
+        def never():
+            self.opt_update.set(False)
+            self._save_config()
+            dlg.destroy()
+
+        def go():
+            dlg.destroy()
+            dl = getattr(self, "_update_dl", None)
+            if not dl:
+                messagebox.showinfo(APP_NAME, "该版本没有可下载的 exe，将打开下载页。")
+                webbrowser.open(url)
+                return
+            self._start_update(dl)
+
+        ttk.Button(foot, text="更新", style="Accent.TButton", width=10,
+                   command=go).pack(side="right")
+        ttk.Button(foot, text="下次再说", style="Ghost.TButton", width=11,
+                   command=later).pack(side="right", padx=(0, 8))
+        ttk.Button(foot, text="以后不再提醒", style="Ghost.TButton", width=13,
+                   command=never).pack(side="left")
+        dlg.bind("<Escape>", lambda e: later())
+        dlg.after(10, lambda: center_on(dlg, self))
+        self.wait_window(dlg)
+
+    def _maybe_show_updated(self):
+        """被更新脚本拉起时，显示 5 秒自动关闭的成功提示。"""
+        args = [a for a in sys.argv[1:] if a != "--updated"]
+        if "--updated" not in sys.argv:
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title("更新成功")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        f = self.f
+        tk.Label(dlg, text="✅ 软件更新成功！", bg=BG, fg=GREEN,
+                 font=(f, 16, "bold")).pack(padx=34, pady=(24, 6))
+        tk.Label(dlg, text=f"当前版本：v{APP_VER}", bg=BG, fg=TEXT,
+                 font=(f, 11)).pack(padx=34)
+        tk.Label(dlg, text="本窗口 5 秒后自动关闭", bg=BG, fg=FAINT,
+                 font=(f, 8)).pack(padx=34, pady=(10, 22))
+        dlg.update_idletasks()
+        center_on(dlg, self)
+        dlg.after(5000, dlg.destroy)
 
     def _ask_agreement(self):
         dlg = PrivacyDialog(self, agreement=True)
@@ -2402,6 +3202,7 @@ class App(tk.Tk):
             self.opt_tools.set(bool(cfg.get("tools", False)))
             self.opt_think.set(bool(cfg.get("think", True)))
             self.opt_egg.set(bool(cfg.get("egg", True)))
+            self.opt_update.set(bool(cfg.get("autoupdate", True)))
             self.opt_tokenwin.set(bool(cfg.get("tokenwin", True)))
             self.card = cfg.get("card", "Q版") or ""
             self.local_bg = cfg.get("local_bg", "") or ""
@@ -2421,6 +3222,7 @@ class App(tk.Tk):
                            "tools": self.opt_tools.get(),
                            "think": self.opt_think.get(), "egg": self.opt_egg.get(),
                            "egg": self.opt_egg.get(),
+                           "autoupdate": self.opt_update.get(),
                            "tokenwin": self.opt_tokenwin.get(),
                            "card": self.card,
                            "local_bg": self.local_bg},
@@ -2474,7 +3276,30 @@ class App(tk.Tk):
             messagebox.showwarning(APP_NAME, "请填 API Key")
             return
         force_all = False
-        if not (list(preset) if preset else []) and not self.selected and not self._manual_models():
+        preset_list = list(preset) if preset else []
+        picked_now = preset_list or self.selected or self._manual_models()
+
+        # 之前已测过部分模型、这次又选了模型 → 问清测哪些
+        tested_before = [r["model"] for r in self.results
+                         if r["status"] not in (PENDING,)]
+        if not preset_list and tested_before and picked_now:
+            picked_set = set(preset_list or self.selected or self._manual_models())
+            tested_set = set(tested_before)
+            only_picked = sorted(picked_set)
+            rest = sorted(tested_set - picked_set)
+            if rest:                    # 只有「还有没测的」才值得问
+                choice = ask_scope(self, len(only_picked), len(rest), len(tested_set))
+                if choice is None:
+                    return
+                if choice == "picked":
+                    preset = only_picked
+                elif choice == "rest":
+                    preset = rest
+                else:
+                    preset = []          # 全部：重新拉清单
+                    force_all = True
+
+        if not (list(preset) if preset else []) and not self.selected and not self._manual_models() and not force_all:
             if not messagebox.askyesno(APP_NAME, "你还没有选中测试模型，继续则默认选择所有模型！\n\n是否继续？"):
                 return
             force_all = True
@@ -2502,14 +3327,32 @@ class App(tk.Tk):
         opts = {"stream": self.opt_stream.get(), "tools": self.opt_tools.get(),
                 "think": self.opt_think.get(), "egg": self.opt_egg.get(),
                 "tokens": max(1, int(float(self.tokens_var.get() or 1)))}
-        if preset:
-            seed = list(preset)
-        elif force_all:
+        if force_all:
             seed = []          # 交给 _run 去 /models 拉全量
+        elif preset:
+            seed = list(preset)
         else:
             seed = list(self.selected) + self._manual_models()
+        self._live_opts = opts          # 供检测中实时开关修改
         threading.Thread(target=self._run, args=(rid, url, key, seed, conc, timeout, opts, False),
                          daemon=True).start()
+
+    def _ask_think_change(self, want):
+        """检测中切换思考开关：确认后对后续模型立即生效。"""
+        if not getattr(self, "_running", False):
+            return True
+        onoff = "开启" if want else "关闭"
+        if not ask_choice(self, APP_NAME,
+                          f"该功能将实时对后续模型生效，是否{onoff}思考能力检测？\n\n"
+                          f"已在检测中的模型不受影响。",
+                          yes_label=f"{onoff}", no_label="取消", primary="no", width=440):
+            return False
+        # 写入正在运行的 opts，worker 读同一份 dict
+        opts = getattr(self, "_live_opts", None)
+        if isinstance(opts, dict):
+            opts["think"] = want
+        self.status.configure(text=f"已{onoff}思考能力检测，对后续模型生效")
+        return True
 
     def _set_running(self, running):
         self._running = running
@@ -2526,9 +3369,9 @@ class App(tk.Tk):
         self.btn_egg.configure(state="disabled" if running else "normal")
         self.btn_tokwin.configure(state="disabled" if running else
                                   ("normal" if any(r.get("tokens") for r in self.results) else "disabled"))
-        self.btn_retry.configure(state="normal" if (not running and bad) else "disabled")
-        self.btn_retryall.configure(state="normal" if (not running and text_models) else "disabled")
+        self.btn_retryall.configure(state="normal" if (not running and bad) else "disabled")
         self.btn_onlyok.configure(state="normal" if (not running and ok_models) else "disabled")
+        self.btn_clear.configure(state="normal" if (not running and has) else "disabled")
 
     def stop(self):
         self.stop_event.set()
@@ -2548,7 +3391,7 @@ class App(tk.Tk):
             if not models:
                 self.q.put(("error", "没有可检测的模型：请获取模型列表并选择，或手动输入模型名", rid))
                 return
-            self.q.put(("total", len(models), rid))
+            self.q.put(("total", len(models), rid, models))
             task_q = queue.Queue()
             for m in models:
                 task_q.put(m)
@@ -2616,16 +3459,25 @@ class App(tk.Tk):
 
                 if kind == "update":
                     tag, url = msg[1], msg[2]
+                    dl = msg[3] if len(msg) > 3 else None
                     if tag and parse_ver(tag) > parse_ver(APP_VER):
                         self._new_ver = tag
-                        self.status.configure(text=f"发现新版本 {tag}，点右上角「关于」查看")
+                        self._update_dl = dl
+                        if self.opt_update.get():
+                            self._show_update(tag, url)
+                        else:
+                            self.status.configure(text=f"发现新版本 {tag}，点右上角「关于」查看")
                     continue
 
-                if kind == "egg":
-                    self.btn_egg.configure(state="normal")
-                    self.status.configure(text="彩蛋结束 · 仅图一乐，不代表模型能力")
-                    if not self._closing and msg[1]:
-                        EggDialog(self, msg[1])
+                if kind == "egg_one":
+                    row, done, total = msg[1], msg[2], msg[3]
+                    dlg = getattr(self, "_egg_dlg", None)
+                    if dlg is not None and dlg.winfo_exists():
+                        dlg.add_row(row)
+                    if done >= total:
+                        self.btn_egg.configure(state="normal")
+                        self.status.configure(text="彩蛋结束 · 仅图一乐，不代表模型能力")
+                        self._egg_dlg = None
                     continue
 
                 if kind == "think":
@@ -2639,6 +3491,7 @@ class App(tk.Tk):
 
                 if kind == "prices":
                     PRICES.update(msg[1])
+                    _PRICE_CACHE.clear()
                     self.lbl_price.configure(
                         text=f"价格 {PRICES['count']} 个 · 每百万 token · 按 1:{USD_RATE} 折算，仅供参考")
                     self._render()
@@ -2678,14 +3531,26 @@ class App(tk.Tk):
 
                 if kind == "total":
                     self.total = msg[1]
+                    names = msg[3] if len(msg) > 3 else []
                     self.progress.configure(maximum=max(1, self.total), value=0)
                     self.lbl_prog.configure(text=f"0 / {self.total}")
                     self.status.configure(text=f"正在检测 {self.total} 个模型…")
+                    # 先把全部模型铺成「未检测」，测到哪个就更新哪个
+                    if names:
+                        self.results = [self._pending_row(m) for m in names]
+                        self._render()
+                        self._schedule_fit()
                 elif kind == "row":
                     r = msg[2]
-                    self.results.append(r)
                     self.done_count = msg[1]
-                    self._insert_row(r)
+                    idx = next((i for i, x in enumerate(self.results)
+                                if x["model"] == r["model"] and x["status"] == PENDING), None)
+                    if idx is None:
+                        self.results.append(r)
+                    else:
+                        self.results[idx] = r
+                    # 直接用结果对象更新对应行，避免按名字反查整表
+                    self._update_row_of(r)
                     self._update_stats()
                     self.progress.configure(value=self.done_count)
                     self.lbl_prog.configure(text=f"{self.done_count} / {self.total}")
@@ -2706,8 +3571,9 @@ class App(tk.Tk):
         self._set_running(False)
         self._auto_sort()
         self._update_stats()
-        ok = sum(1 for r in self.results if r["status"] == OK)
-        lim = sum(1 for r in self.results if r["status"] == DEGRADED)
+        done = [r for r in self.results if r["status"] not in (PENDING, SKIP)]
+        ok = sum(1 for r in done if r["status"] == OK)
+        lim = sum(1 for r in done if r["status"] == DEGRADED)
         bad = sum(1 for r in self.results if r["status"] in (MISSING, NO_ACCESS))
         other = len(self.results) - ok - lim - bad
         head = "已停止" if stopped else "检测完成"
@@ -2727,7 +3593,7 @@ class App(tk.Tk):
             self.show_tokens()
 
     def run_egg(self):
-        ok_models = [r for r in self.results
+        ok_models = [r["model"] for r in self.results
                      if r["status"] == OK and r.get("kind") == "chat"]
         if not ok_models:
             messagebox.showinfo(APP_NAME, "还没有已连通的对话模型，先跑一次检测吧")
@@ -2736,21 +3602,52 @@ class App(tk.Tk):
         if not key:
             messagebox.showwarning(APP_NAME, "请先填写 API Key")
             return
-        ok_models.sort(key=lambda x: x.get("latency") or 10 ** 9)
-        picks = [r["model"] for r in ok_models[:3]]
         url = normalize_base(self.url_var.get())
+        picker = EggPickDialog(self, len(ok_models))
+        self.wait_window(picker)
+        if not picker.confirmed:
+            return
+        scope = picker.scope
+        if scope == "all":
+            picks = list(ok_models)
+        else:
+            pool = [m for m in ok_models if m not in self._egg_seen] or list(ok_models)
+            random.shuffle(pool)
+            picks = pool[:3]
+        # 记录已出过的模型，保证「再来一次」换人
+        for m in picks:
+            self._egg_seen.add(m)
+        if len(self._egg_seen) >= len(ok_models):
+            self._egg_seen.clear()
+
         self.btn_egg.configure(state="disabled")
         self.status.configure(text=f"彩蛋进行中：{len(picks)} 个模型正在思考洗车问题…")
+        # 先弹窗，实时显示进度
+        dlg = EggDialog(self, [], total=len(picks), pending=picks)
+        self._egg_dlg = dlg
+        self._egg_url, self._egg_key = url, key
+
+        self._egg_paused = False
 
         def work():
             rows = []
             for m in picks:
+                # 暂停：等待恢复，或窗口关闭/再次暂停时退出
+                while getattr(self, "_egg_paused", False):
+                    dlg = getattr(self, "_egg_dlg", None)
+                    if dlg is None or not dlg.winfo_exists() or self._closing:
+                        return
+                    time.sleep(0.1)
+                dlg0 = getattr(self, "_egg_dlg", None)
+                if dlg0 is None or not dlg0.winfo_exists():
+                    return
                 try:
-                    rows.append(ask_carwash(url, key, m, 30))
+                    row = ask_carwash(url, key, m, 30)
                 except Exception as e:
-                    rows.append({"model": m, "ok": None, "text": str(e), "ms": 0,
-                                 "why": "请求异常", "q": "", "tag": ""})
-            self.q.put(("egg", rows, self.run_id))
+                    row = {"model": m, "ok": None, "text": str(e), "ms": 0,
+                           "why": "请求异常", "q": "", "tag": ""}
+                rows.append(row)
+                self.q.put(("egg_one", row, len(rows), len(picks)))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -2780,7 +3677,8 @@ class App(tk.Tk):
                f"每个模型会发起 1 次最小出图请求（512×512），可能产生少量费用。")
         if others:
             msg += f"\n另有 {len(others)} 个语音/视频模型需专用接口，暂不自动检测。"
-        if not messagebox.askyesno(APP_NAME, msg):
+        if not ask_choice(self, APP_NAME, msg, yes_label="是", no_label="否",
+                          primary="no", width=560):
             self.status.configure(text=self.status.cget("text") + f" · 已跳过 {len(pending)} 个图片模型")
             return
         self.run_id += 1
@@ -2822,8 +3720,8 @@ class App(tk.Tk):
                 parts.append("思考✓")
             else:
                 parts.append("思考✗")
-        if r.get("usage") is not None and r["kind"] in ("chat", "embed"):
-            parts.append("计量✓" if r["usage"] else "计量✗")
+        if r.get("usage") and r["kind"] in ("chat", "embed"):
+            parts.append("计量✓")
         return " ".join(parts) if parts else "—"
 
     def _detail_text(self, r):
@@ -2838,36 +3736,83 @@ class App(tk.Tk):
             tag = "special"
         return tag
 
+    def _schedule_row_refresh(self):
+        """合并高频行更新：120ms 内只做一次收尾，避免每个结果都触发重绘。
+
+        Treeview 本身是虚拟化的（只画可见行），单次 item() 仅 0.01ms；
+        成本全在「触发一次重绘」约 10ms。检测 184 个模型若逐个触发
+        就是 1.8 秒的纯界面开销，合并后约 10 次。
+        """
+        if getattr(self, "_row_job", None):
+            return
+        self._row_job = self.after(120, self._flush_row_refresh)
+
+    def _flush_row_refresh(self):
+        self._row_job = None
+        if getattr(self, "_closing", False):
+            return
+        try:
+            self.table.update_idletasks()
+        except Exception:
+            pass
+
+    def _row_values(self, r):
+        """构造一行的显示值（唯一来源，避免三处重复）。"""
+        sym, _ = BADGE.get(r["status"], ("?", "muted"))
+        lat = f"{r['latency']} ms" if r.get("latency") is not None else "—"
+        return (f"{sym} {r['status']}",
+                self._fit(r["model"], self._model_width()),
+                spec_text(r["model"]), lat,
+                self._cap_text(r),
+                self._fit(self._detail_text(r), self._detail_width()),
+                price_for(r["model"]) or "—")
+
+    def _row_iid(self, r):
+        # 用模型名做 iid：结果对象在检测过程中会被替换，id() 会变，
+        # 用 id() 会导致同一模型出现两行（旧占位行 + 新结果行）。
+        return "row:" + r["model"]
+
+    def _update_row_of(self, r):
+        """按结果对象增量更新一行（O(1) 定位，不遍历列表）。"""
+        iid = self._row_iid(r)
+        if self.table.exists(iid):
+            self.table.item(iid, values=self._row_values(r), tags=(self._style(r),))
+        elif self._match(r):
+            self._insert_row(r)
+        self._schedule_row_refresh()
+
+    def _drop_stale_rows(self, keep):
+        """删除不在 keep 集合里的行（模型被替换后残留的旧行）。"""
+        stale = [iid for iid in self.table.get_children() if iid not in keep]
+        if stale:
+            self.table.delete(*stale)
+
     def _refresh_row(self, model):
+        """增量更新单个模型对应的行（不重建整表）。"""
         for r in self.results:
             if r["model"] != model:
                 continue
-            iid = f"r{id(r)}"
+            iid = self._row_iid(r)
             if self.table.exists(iid):
-                sym, _ = BADGE.get(r["status"], ("?", "muted"))
-                lat = f"{r['latency']} ms" if r.get("latency") is not None else "—"
-                self.table.item(iid, values=(f"{sym} {r['status']}",
-                                             self._fit(r["model"], self._model_width() + 16),
-                                             spec_text(r["model"]), lat,
-                                             self._cap_text(r),
-                                             self._fit(self._detail_text(r), self._detail_width()),
-                                             price_for(r["model"]) or "—"))
+                self.table.item(iid, values=self._row_values(r),
+                                tags=(self._style(r),))
+            self._schedule_row_refresh()
             break
+
+    def _pending_row(self, model):
+        """待测模型的占位行。"""
+        return {"model": model, "status": PENDING, "http": None, "latency": None,
+                "kind": kind_of(model), "detail": "", "zh": "", "usage": None,
+                "stream": None, "tools": None, "tokens": None, "think": None}
 
     def _insert_row(self, r):
         if not self._match(r):
             return
-        iid = f"r{id(r)}"
+        iid = self._row_iid(r)
         if self.table.exists(iid):
             return
-        sym, _ = BADGE.get(r["status"], ("?", "muted"))
-        lat = f"{r['latency']} ms" if r.get("latency") is not None else "—"
         stripe = len(self.table.get_children()) % 2 == 1
-        self.table.insert("", "end", iid=iid,
-                          values=(f"{sym} {r['status']}", self._fit(r["model"], self._model_width() + 16),
-                                  spec_text(r["model"]), lat,
-                                  self._cap_text(r), self._fit(self._detail_text(r), self._detail_width()),
-                                  price_for(r["model"]) or "—"),
+        self.table.insert("", "end", iid=iid, values=self._row_values(r),
                           tags=(self._style(r), "stripe") if stripe else (self._style(r),))
 
     def _match(self, r):
@@ -2886,27 +3831,45 @@ class App(tk.Tk):
         return True
 
     def _render(self):
+        # 记住滚动位置，重绘后恢复，避免点击/刷新时跳回顶部
+        try:
+            first = self.table.yview()[0]
+        except Exception:
+            first = None
         self.table.delete(*self.table.get_children())
         for r in self.results:
             if self._match(r):
-                sym, _ = BADGE.get(r["status"], ("?", "muted"))
-                lat = f"{r['latency']} ms" if r.get("latency") is not None else "—"
-                self.table.insert("", "end", iid=f"r{id(r)}",
-                                  values=(f"{sym} {r['status']}",
-                                          self._fit(r["model"], self._model_width() + 16),
-                                          spec_text(r["model"]), lat,
-                                          self._cap_text(r),
-                                          self._fit(self._detail_text(r), self._detail_width()),
-                                          price_for(r["model"]) or "—"),
+                self.table.insert("", "end", iid=self._row_iid(r),
+                                  values=self._row_values(r),
                                   tags=(self._style(r),))
+        if first:                       # 恢复滚动位置
+            try:
+                self.table.yview_moveto(first)
+            except Exception:
+                pass
 
     def _fit(self, text, px):
+        """按像素宽度截断。结果按 (文字, 宽度) 缓存，重绘时不再逐字测量。"""
+        key = (text, px)
+        hit = self._fit_cache.get(key)
+        if hit is not None:
+            return hit
         try:
             if self._fcell.measure(text) <= px:
+                self._fit_cache[key] = text
                 return text
-            while text and self._fcell.measure(text + "…") > px:
-                text = text[:-1]
-            return text + "…"
+            lo, hi = 0, len(text)
+            while lo < hi:                      # 二分找最大可容纳长度
+                mid = (lo + hi + 1) // 2
+                if self._fcell.measure(text[:mid] + "…") <= px:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            out = (text[:lo] + "…") if lo < len(text) else text
+            if len(self._fit_cache) > 4000:      # 简单上限，防止无限增长
+                self._fit_cache.clear()
+            self._fit_cache[key] = out
+            return out
         except Exception:
             return text
 
@@ -2925,24 +3888,42 @@ class App(tk.Tk):
         self._fit_job = None
         if getattr(self, "_running", False):
             return
+        old_w = self.table.column("model", "width")
         self._fit_columns()
+        new_w = self.table.column("model", "width")
+        # 列宽变化后必须重排，否则行内存的仍是旧宽度算出的省略文本
+        if abs(new_w - old_w) > 4:
+            self._render()
 
     def _fit_columns(self, event=None):
         """按表格实际宽度分配列宽，窗口变窄也不会把最后一列挤出去。"""
         try:
-            total = self.table.winfo_width() - 14
+            # 减去竖向滚动条与边框，确保七列不触发横向滚动
+            total = self.table.winfo_width() - 22
         except Exception:
             return
         if total < 320:
             return
-        w_status, w_spec, w_lat, w_cap, w_price = 60, 90, 58, 164, 150
-        rest = total - w_status - w_spec - w_lat - w_cap - w_price
-        # 模型列按最长名称给宽度，保证显示全称
         longest = getattr(self, "_max_model_px", 0)
-        w_model = max(112, min(220, longest + 20))
-        if w_model > rest - 120:
-            w_model = max(120, rest - 120)
-        w_detail = max(120, rest - w_model - 8)
+
+        # 四档预算：窗口越窄，固定列同步收紧，保证七列始终塞进视口
+        if total >= 780:
+            w_status, w_spec, w_lat, w_price, min_left = 56, 86, 54, 156, 150
+        elif total >= 640:
+            w_status, w_spec, w_lat, w_price, min_left = 52, 78, 50, 140, 130
+        else:
+            w_status, w_spec, w_lat, w_price, min_left = 46, 66, 46, 118, 110
+
+        rest = total - w_status - w_spec - w_lat - w_price
+        # 说明列优先级高于模型列：先保住说明能显示完整错误原因（约 118px）
+        cap_floor = 150                    # 能力列需容纳「流式✓ 工具✓ 思考✓ 计量✓」
+        detail_floor = 118 if rest > 420 else 92
+        w_model = min(longest + 18, 260)
+        # 先留出能力列与说明列，剩余才是模型列
+        w_model = max(88, min(w_model, rest - cap_floor - detail_floor))
+        left = max(cap_floor + detail_floor, rest - w_model)
+        w_cap = cap_floor
+        w_detail = max(detail_floor, left - w_cap)
         try:
             old_m = self.table.column("model", "width")
             old_d = self.table.column("detail", "width")
@@ -2984,18 +3965,44 @@ class App(tk.Tk):
     def set_filter(self, key):
         self.filter_key = key
         self._paint_chips()
+        # 切换状态时按「可用→受限→不可用→其他→未检测」重排，并回到顶部
+        self._sort_for_view()
         self._render()
-
-    def _update_stats(self):
-        total = len(self.results)
         try:
-            self._max_model_px = max((self._fcell.measure(r["model"]) for r in self.results), default=0)
+            self.table.yview_moveto(0)
         except Exception:
             pass
-        ok = sum(1 for r in self.results if r["status"] == OK)
-        lim = sum(1 for r in self.results if r["status"] == DEGRADED)
-        bad = sum(1 for r in self.results if r["status"] in (MISSING, NO_ACCESS, RATE, UNKNOWN, KEY_BAD))
-        lat = [r["latency"] for r in self.results if r.get("latency")]
+
+    def _sort_for_view(self):
+        """状态分组优先，组内按延迟升序（无延迟的排后）。"""
+        def key(r):
+            lat = r.get("latency")
+            special = 1 if r.get("kind") in ("image", "audio", "video") else 0
+            return (GROUP.get(r["status"], 9), special,
+                    lat if lat is not None else 10 ** 9, r["model"])
+        self.results.sort(key=key)
+
+    def _update_stats(self):
+        # 「已检测」只算真正测完的（排除未检测/跳过），随进度递增
+        total = sum(1 for r in self.results if r["status"] not in (PENDING, SKIP))
+        # 模型名最长像素只在「模型集合变化」时重算：检测过程中每来一个结果
+        # 都重量一遍 184 个名字要 60+ 次、每次 ~4ms，是纯粹的浪费。
+        names = len(self.results)
+        if names != getattr(self, "_measured_count", -1):
+            prev_max = self._max_model_px
+            try:
+                self._max_model_px = max((self._fcell.measure(r["model"])
+                                          for r in self.results), default=0)
+            except Exception:
+                pass
+            self._measured_count = names
+            if abs(self._max_model_px - prev_max) > 8:
+                self._schedule_fit()
+        done = [r for r in self.results if r["status"] not in (PENDING, SKIP)]
+        ok = sum(1 for r in done if r["status"] == OK)
+        lim = sum(1 for r in done if r["status"] == DEGRADED)
+        bad = sum(1 for r in done if r["status"] in (MISSING, NO_ACCESS, RATE, UNKNOWN, KEY_BAD))
+        lat = [r["latency"] for r in done if r.get("latency")]
         self.c_total.set(total or "—")
         self.c_ok.set(ok)
         self.c_lim.set(lim)
@@ -3004,13 +4011,40 @@ class App(tk.Tk):
         self._schedule_fit()
 
     def _auto_sort(self):
+        """按「可用→受限→不可用→其他→未检测」重排。
+
+        用 table.move() 调整行的位置，不重建整表：重建需 Python 循环
+        insert 全部行（184 行约 13ms + 一次全量重绘），move 只是移动
+        索引，代价极低且保留当前的选中与滚动状态。
+        """
         def key(r):
             lat = r.get("latency")
             special = 1 if r.get("kind") in ("image", "audio", "video") else 0
             return (GROUP.get(r["status"], 3), special,
                     lat if lat is not None else 10 ** 9, r["model"])
         self.results.sort(key=key)
-        self._render()
+
+        # 若当前有筛选/搜索在生效，可见行只是子集，不能只靠 move 重排，
+        # 否则会把不该显示的行挤到可见区。这种情况退回全量重建。
+        if self.filter_key != "all" or self.search_var.get().strip():
+            self._render()
+            return
+
+        order = [self._row_iid(r) for r in self.results if self.table.exists(self._row_iid(r))]
+        if not order:
+            return
+        try:
+            first = self.table.yview()[0]
+        except Exception:
+            first = None
+        for i, iid in enumerate(order):
+            self.table.move(iid, "", i)
+        if first:
+            try:
+                self.table.yview_moveto(first)
+            except Exception:
+                pass
+        self._schedule_row_refresh()
 
     def _sort(self, col):
         rows = [(self.table.set(iid, col), iid) for iid in self.table.get_children()]
@@ -3179,6 +4213,29 @@ class App(tk.Tk):
         self.status.configure(text=f"只重试 {len(bad)} 个失败项…")
         self.start(preset=bad)
 
+    def clear_all(self):
+        """清空结果表与所有输入，便于重新检测。"""
+        if not ask_choice(self, APP_NAME,
+                          "将清空检测结果、已选模型和手动输入的模型名，\n"
+                          "API 地址与 Key 保留。确定清空吗？",
+                          yes_label="确定清空", no_label="取消", primary="no", width=460):
+            return
+        self.results = []
+        self.selected = []
+        self.all_models = []
+        self.done_count = 0
+        self.total = 0
+        self.table.delete(*self.table.get_children())
+        for c in (self.c_total, self.c_ok, self.c_lim, self.c_bad, self.c_lat):
+            c.set("—")
+        self.txt_models.delete("1.0", "end")
+        self.lbl_sel.configure(text="未选择", fg=FAINT)
+        self.progress.configure(value=0, maximum=1)
+        self.lbl_prog.configure(text="")
+        self.status.configure(text="已清空，可以重新检测")
+        self._set_running(False)
+        self._update_stats()
+
     def retest_all(self):
         models = [r["model"] for r in self.results if r.get("kind") in ("chat", "embed")]
         if not models:
@@ -3231,6 +4288,15 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, f"导出失败：{e}")
 
     def _on_close(self):
+        """点 X 时二次确认：高亮「下次再来吧~」。"""
+        if not getattr(self, "_closing", False):
+            # ask_choice 返回 True 代表点了「是」。这里「再探再报！」= 留在程序，
+            # 「下次再来吧~」= 退出，所以返回 True 时应取消退出。
+            if ask_choice(self, APP_NAME,
+                          "确定要退出吗？\n\n检测数据不会保存，下次需要重新跑一遍。",
+                          yes_label="再探再报！", no_label="下次再来吧~",
+                          primary="no", width=420):
+                return
         self._closing = True
         self.stop_event.set()
         self.run_id += 1
