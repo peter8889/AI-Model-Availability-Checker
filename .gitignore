@@ -1,0 +1,10 @@
+.gh_token
+release/
+dist/*.exe
+build/
+__pycache__/
+*.spec
+_s*.py
+shot*.png
+chk_*.png
+crop_*.png
