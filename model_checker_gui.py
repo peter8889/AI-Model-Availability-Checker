@@ -40,7 +40,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
 
 APP_NAME = "AI 模型检测"
-APP_VER = "2.4"
+APP_VER = "2.5"
 UPDATE_REPO = "peter8889/AI-Model-Availability-Checker"
 TELEGRAM = "https://t.me/OiPeter"
 USD_RATE = 7.1   # 美元→人民币折算（仅参考）
@@ -3174,8 +3174,13 @@ class App(tk.Tk):
                  font=(f, 15, "bold")).pack(anchor="w", padx=24, pady=(20, 6))
         tk.Label(dlg, text=f"当前版本 v{APP_VER}。新版本通常包含功能改进与问题修复。",
                  bg=BG, fg=MUTED, font=(f, 9)).pack(anchor="w", padx=24)
-        tk.Label(dlg, text=url, bg=BG, fg=ACCENT, font=(f, 8),
-                 wraplength=420, justify="left").pack(anchor="w", padx=24, pady=(6, 0))
+        # 链接要能点：Label 默认不可交互，需要手动绑定点击 + 手型光标
+        link = tk.Label(dlg, text=url, bg=BG, fg=ACCENT, font=(f, 8, "underline"),
+                        wraplength=420, justify="left", cursor="hand2")
+        link.pack(anchor="w", padx=24, pady=(6, 0))
+        link.bind("<Button-1>", lambda e: webbrowser.open(url))
+        link.bind("<Enter>", lambda e: link.configure(fg=ACCENT_DARK))
+        link.bind("<Leave>", lambda e: link.configure(fg=ACCENT))
 
         foot = tk.Frame(dlg, bg=BG)
         foot.pack(fill="x", padx=24, pady=(16, 18))

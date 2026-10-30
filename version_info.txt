@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2, 4, 0, 0),
-    prodvers=(2, 4, 0, 0),
+    filevers=(2, 5, 0, 0),
+    prodvers=(2, 5, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -14,12 +14,12 @@ VSVersionInfo(
       StringTable('080404B0', [
         StringStruct('CompanyName', ''),
         StringStruct('FileDescription', 'AI 模型可用性检测工具'),
-        StringStruct('FileVersion', '2.4.0.0'),
+        StringStruct('FileVersion', '2.5.0.0'),
         StringStruct('InternalName', 'ModelChecker'),
         StringStruct('LegalCopyright', ''),
         StringStruct('OriginalFilename', 'ModelChecker.exe'),
         StringStruct('ProductName', 'AI 模型检测'),
-        StringStruct('ProductVersion', '2.4.0.0')
+        StringStruct('ProductVersion', '2.5.0.0')
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
