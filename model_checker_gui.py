@@ -1614,26 +1614,44 @@ def ask_choice(app, title, text, yes_label="是", no_label="否",
 
 
 def center_on(win, parent=None):
-    """把弹窗放到父窗口正中；父窗口尺寸不可信时退回屏幕居中。"""
+    """把弹窗居中到父窗口（或屏幕）。
+
+    实测关系（Windows 11）：
+        winfo_rootx - winfo_x = 8    左边框
+        winfo_rooty - winfo_y = 31   标题栏
+    geometry("+x+y") 定位的是「外框左上角」，而 winfo_width/height 是「客户区」尺寸。
+    所以要让客户区中心对齐，必须把外框差量补回去。
+    """
     try:
         win.update_idletasks()
         w, h = win.winfo_width(), win.winfo_height()
         if w <= 1 or h <= 1:
             w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+
+        # 外框相对客户区的偏移：优先实测，量不到时退回 Windows 常见值
+        try:
+            off_x = win.winfo_rootx() - win.winfo_x()
+            off_y = win.winfo_rooty() - win.winfo_y()
+            if not (0 <= off_x < 60 and 0 <= off_y < 80):
+                off_x, off_y = 8, 31
+        except Exception:
+            off_x, off_y = 8, 31
+
         if parent is not None:
             pw, ph = parent.winfo_width(), parent.winfo_height()
             px, py = parent.winfo_rootx(), parent.winfo_rooty()
             if pw > 200 and ph > 200:
-                x = px + max(0, (pw - w) // 2)
-                y = py + max(0, (ph - h) // 2)
-                # 确保不超出屏幕
+                # 客户区中心 = 父客户区中心
+                x = px + (pw - w) // 2 - off_x
+                y = py + (ph - h) // 2 - off_y
                 sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-                x = max(0, min(x, sw - w - 8))
-                y = max(0, min(y, sh - h - 48))
+                x = max(0, min(x, sw - w - 16))
+                y = max(0, min(y, sh - h - off_y - 8))
                 win.geometry(f"+{x}+{y}")
                 return
+
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        win.geometry(f"+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2 - 30)}")
+        win.geometry(f"+{max(0, (sw - w) // 2 - off_x)}+{max(0, (sh - h) // 2 - off_y)}")
     except Exception:
         pass
 
@@ -2619,6 +2637,9 @@ class AboutDialog(tk.Toplevel):
         ttk.Button(foot, text="关闭", style="Primary.TButton", width=8,
                    command=self.destroy).pack(side="right")
         self.bind("<Escape>", lambda e: self.destroy())
+        # 弹窗默认出现在屏幕左上区域，必须显式居中
+        center_on(self, app)
+        self.after(30, lambda: center_on(self, app))
 
     def _accept(self):
         self.accepted = True

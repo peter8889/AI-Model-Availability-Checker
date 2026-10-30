@@ -131,7 +131,7 @@ tkinter 常被诟病卡顿，但问题通常不在 Python，而在渲染方式�
 | 版本 | SHA-256 |
 | --- | --- |
 | v1.0 | `ad34ea6fa0257e315c0983870b08c081156cd622248d7a01615915291f77e0b4` |
-| v2.5 | `a451fa7bade160edd26457b408c0730db8eba7b1975af4204883bcd5ab08897e` |
+| v2.5 | `6108061839ed6a0dbf926adc822cb896e2759967c103f9f0ca8026f09d02885c` |
 | v2.4 | `98e8400f0fe5a677deba600256010e3f1f201bccb1fde1e1286a4f2227dba21d` |
 | v2.3 | `c8ee22c6b7f570df33cb351deeef55adaafd52ac6166a627ae7d14dbd296b541` |
 | v2.2 | `510f7e7948401e62ed48121d3dbd5a95c03db431dc44472e2e4ba902b82af1ce` |
@@ -155,7 +155,7 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed ^
 
 | 版本 | 主要内容 |
 | --- | --- |
-| [v2.5](https://github.com/peter8889/AI-Model-Availability-Checker/releases/tag/v2.5) | 更新提示里的 GitHub 链接改为可点击（手型光标、悬停变色、点击打开） |
+| [v2.5](https://github.com/peter8889/AI-Model-Availability-Checker/releases/tag/v2.5) | 更新提示里的 GitHub 链接改为可点击；关于/隐私等弹窗精确居中（修正标题栏与边框偏移）；清理 `_MEI` 残留解压目录导致的 DLL 加载失败 |
 | [v2.4](https://github.com/peter8889/AI-Model-Availability-Checker/releases/tag/v2.4) | **按住左键拖动多选**；右键多选不丢失；多模型合并详情；选中保留状态色；检测中列宽正常；可用模型补充说明；延迟/能力排序可用置顶；彩蛋按钮状态复位；下载完整性校验 |
 | [v2.3](https://github.com/peter8889/AI-Model-Availability-Checker/releases/tag/v2.3) | **性能提升 8.8 倍**（增量渲染 + 合并刷新 + move 排序，掉帧归零）；软件内更新与自替换重启；「未检测」状态与三选一检测范围；彩蛋可滚动、实时进度、暂停、离线作答；API 到期检测；一键清空；检测中实时开关思考 |
 | [v2.2](https://github.com/peter8889/AI-Model-Availability-Checker/releases/tag/v2.2) | 思考能力探测（11 家厂商参数差异自适应）、上下文/输出规格列、用量金额估算、余额查询、洗车彩蛋 |
