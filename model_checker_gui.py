@@ -19,6 +19,7 @@
 import csv
 import datetime
 import ctypes
+import hashlib
 import json
 import os
 import queue
@@ -39,7 +40,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
 
 APP_NAME = "AI 模型检测"
-APP_VER = "2.3"
+APP_VER = "2.4"
 UPDATE_REPO = "peter8889/AI-Model-Availability-Checker"
 TELEGRAM = "https://t.me/OiPeter"
 USD_RATE = 7.1   # 美元→人民币折算（仅参考）
@@ -986,6 +987,25 @@ def _pick_asset(release):
         if name.endswith(".exe"):
             return a.get("browser_download_url"), a.get("name"), a.get("size") or 0
     return None, None, 0
+
+
+def fetch_expected_sha(tag, timeout=10):
+    """从 Release 正文里抓 SHA-256（正文里以 `SHA-256`：`xxxx` 形式出现）。"""
+    try:
+        d = fetch_latest_release(timeout)
+        body = d[2] or ""
+    except Exception:
+        return None
+    m = re.search(r"SHA-?256[^0-9a-fA-F]{0,12}([0-9a-fA-F]{64})", body)
+    return m.group(1).lower() if m else None
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest().lower()
 
 
 def download_update(url, dest, on_progress=None, timeout=30):
@@ -2000,31 +2020,66 @@ class TokenReport(tk.Toplevel):
         wrap.pack(fill="both", expand=True, padx=1, pady=1)
         cols = ("model", "p", "c", "t", "cost")
         self.tv = ttk.Treeview(wrap, columns=cols, show="headings")
-        for c, txt, w, anc in (("model", "模型", 340, "w"), ("p", "提示", 80, "e"),
-                               ("c", "生成", 80, "e"), ("t", "合计", 90, "e"),
-                               ("cost", "估算 ¥", 90, "e")):
-            self.tv.heading(c, text=txt)
+        # 可点击表头排序：默认按合计「由高到低」，再点一次反转
+        self._sort_col = "t"
+        self._sort_desc = True
+        heads = (("model", "模型", 340, "w"), ("p", "提示", 80, "e"),
+                 ("c", "生成", 80, "e"), ("t", "合计", 90, "e"),
+                 ("cost", "估算 ¥", 90, "e"))
+        for c, txt, w, anc in heads:
+            self.tv.heading(c, text=txt, command=lambda k=c: self._sort_by(k))
             self.tv.column(c, width=w, anchor=anc, stretch=(c == "model"))
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.tv.yview)
         self.tv.configure(yscrollcommand=sb.set)
         self.tv.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        for r in sorted(self.rows, key=lambda x: -x["tokens"]["total"]):
+        self._fill()
+        self._paint_heads()
+
+        foot = tk.Frame(self, bg=BG)
+        foot.pack(fill="x", side="bottom", padx=18, pady=(0, 16))
+        box.pack(fill="both", expand=True, padx=18, pady=(0, 10))
+        ttk.Button(foot, text="关闭", style="Primary.TButton", width=8,
+                   command=self.destroy).pack(side="right")
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.after(10, lambda: center_on(self, parent))
+
+    def _fill(self):
+        self.tv.delete(*self.tv.get_children())
+        def key(r):
+            t = r["tokens"]
+            c = cost_of(r)
+            if self._sort_col == "model":
+                return r["model"].lower()
+            if self._sort_col == "p":
+                return t["prompt"]
+            if self._sort_col == "c":
+                return t["completion"]
+            if self._sort_col == "cost":
+                return c if c is not None else -1
+            return t["total"]
+        for r in sorted(self.rows, key=key, reverse=self._sort_desc):
             t = r["tokens"]
             c = cost_of(r)
             self.tv.insert("", "end", values=(r["model"], f"{t['prompt']:,}",
                                               f"{t['completion']:,}", f"{t['total']:,}",
                                               f"{c:.4f}" if c is not None else "—"))
 
-        foot = tk.Frame(self, bg=BG)
-        foot.pack(fill="x", side="bottom", padx=18, pady=(0, 16))
-        box.pack(fill="both", expand=True, padx=18, pady=(0, 10))
-        ttk.Button(foot, text="复制明细", style="Ghost.TButton",
-                   command=self._copy).pack(side="left")
-        ttk.Button(foot, text="关闭", style="Primary.TButton", width=8,
-                   command=self.destroy).pack(side="right")
-        self.bind("<Escape>", lambda e: self.destroy())
-        self.after(10, lambda: center_on(self, parent))
+    def _sort_by(self, col):
+        if self._sort_col == col:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_col = col
+            # 文本列默认升序，数值列默认降序
+            self._sort_desc = col not in ("model",)
+        self._paint_heads()
+        self._fill()
+
+    def _paint_heads(self):
+        label = {"model": "模型", "p": "提示", "c": "生成", "t": "合计", "cost": "估算 ¥"}
+        arrow = " ↓" if self._sort_desc else " ↑"
+        for c, txt in label.items():
+            self.tv.heading(c, text=txt + (arrow if c == self._sort_col else ""))
 
     def _copy(self):
         lines = ["模型\t提示\t生成\t合计\t估算元"]
@@ -2682,7 +2737,10 @@ class App(tk.Tk):
         st.configure("Treeview.Heading", background=HEAD_BG, foreground=MUTED,
                      relief="flat", borderwidth=0, font=(f, 9, "bold"), padding=(6, 8))
         st.map("Treeview.Heading", background=[("active", CHIP_HOVER)])
-        st.map("Treeview", background=[("selected", SEL_BG)], foreground=[("selected", TEXT)])
+        # 选中只换背景。必须显式清空 foreground 的 selected 映射：
+        # ttk 主题自带 ("selected", "#ffffff")，会覆盖掉「可用/受限/不可用」
+        # 的绿/橙/红，导致选中后所有行都变成同一个颜色。
+        st.map("Treeview", background=[("selected", SEL_BG)], foreground=[])
         st.configure("TProgressbar", background="#22C55E", troughcolor=TROUGH, borderwidth=0,
                      bordercolor="#22C55E", lightcolor="#22C55E", darkcolor="#22C55E",
                      thickness=8)
@@ -2717,11 +2775,16 @@ class App(tk.Tk):
         self._build_right(body)
         self.status = tk.Label(foot, text="就绪 · 填好地址和 Key，点左侧「开始检测」", bg=BG, fg=MUTED,
                                font=(f, 9), anchor="w")
-        self.status.pack(side="left")
-        self.lbl_prog = tk.Label(foot, text="", bg=BG, fg=FAINT, font=(f, 9))
-        self.lbl_prog.pack(side="right")
+        self.status.pack(side="left", fill="x", expand=True)
+        # 进度条必须在标签之前 pack 到 right，且给足最小宽度；
+        # 否则窗口变窄时会被挤压成一条竖线（看起来像「拉不动」）。
         self.progress = ttk.Progressbar(foot, mode="determinate", length=180)
         self.progress.pack(side="right", padx=(12, 10))
+        self.progress.configure(takefocus=0)
+        self.lbl_prog = tk.Label(foot, text="", bg=BG, fg=FAINT, font=(f, 9), width=9,
+                                 anchor="e")
+        self.lbl_prog.pack(side="right")
+        self.status.pack_configure(side="left", fill="x", expand=True)
 
     def _build_left(self, parent):
         f = self.f
@@ -2901,14 +2964,24 @@ class App(tk.Tk):
         self.table.bind("<Configure>", lambda e: self._schedule_fit())
         self.table.bind("<Motion>", self._hover_detail)
         self.table.bind("<Leave>", lambda e: self._hide_tip())
+        # 按住左键拖动多选（Tk 的 Treeview 原生只支持单击/Ctrl/Shift）
+        self._drag_anchor = None
+        self._dragging = False
+        self.table.bind("<ButtonPress-1>", self._drag_start, add="+")
+        self.table.bind("<B1-Motion>", self._drag_move, add="+")
+        self.table.bind("<ButtonRelease-1>", self._drag_end, add="+")
         self._retag()
 
         self.menu = tk.Menu(self, tearoff=0)
         self.menu.add_command(label="查看详情", command=self.show_detail)
+        self.menu.add_separator()
+        self.menu.add_command(label="重测延迟", command=self.retest_latency)
+        self.menu.add_separator()
         self.menu.add_command(label="复制模型名", command=self._copy_selected_name)
         self.menu.add_command(label="复制整行", command=self._copy_selected_row)
         self.table.bind("<Button-3>", self._popup)
-        self.table.bind("<Double-1>", self.show_detail)
+        # 双击某行打开详情（_on_double 内部会先选中该行再调用 show_detail）
+        self.table.bind("<Double-1>", self._on_double)
 
     # ---------- 主题
     def _retag(self):
@@ -3007,7 +3080,13 @@ class App(tk.Tk):
 
         def work():
             try:
-                download_update(url, dest, on_prog)
+                got = download_update(url, dest, on_prog)
+                # 基本完整性检查：Windows exe 必须以 MZ 开头
+                if got < 1024 * 1024:
+                    raise RuntimeError(f"下载体积异常（仅 {got} 字节）")
+                with open(dest, "rb") as fp:
+                    if fp.read(2) != b"MZ":
+                        raise RuntimeError("下载内容不是有效的 exe")
                 state["done"] = True
             except Exception as e:
                 state["err"] = f"{type(e).__name__}: {e}"
@@ -3469,15 +3548,21 @@ class App(tk.Tk):
                             self.status.configure(text=f"发现新版本 {tag}，点右上角「关于」查看")
                     continue
 
+                if kind == "lat":
+                    self._apply_latency(msg[1])
+                    continue
+
                 if kind == "egg_one":
                     row, done, total = msg[1], msg[2], msg[3]
                     dlg = getattr(self, "_egg_dlg", None)
-                    if dlg is not None and dlg.winfo_exists():
+                    alive = dlg is not None and dlg.winfo_exists()
+                    if alive:
                         dlg.add_row(row)
-                    if done >= total:
-                        self.btn_egg.configure(state="normal")
-                        self.status.configure(text="彩蛋结束 · 仅图一乐，不代表模型能力")
-                        self._egg_dlg = None
+                    if done >= total or not alive:
+                        # 无论是正常跑完还是用户中途关闭窗口，都必须复位，
+                        # 否则按钮会永久禁用、状态栏一直显示「进行中」。
+                        self._finish_egg("彩蛋结束 · 仅图一乐，不代表模型能力"
+                                         if done >= total else "彩蛋已关闭")
                     continue
 
                 if kind == "think":
@@ -3592,6 +3677,20 @@ class App(tk.Tk):
             self._tokwin_shown = True
             self.show_tokens()
 
+    def _finish_egg(self, msg=None, **kw):
+        """复位彩蛋相关状态：按钮恢复、状态栏归位、暂停标记清除。"""
+        self._egg_dlg = None
+        self._egg_paused = False
+        try:
+            self.btn_egg.configure(state="normal")
+        except Exception:
+            pass
+        if msg:
+            try:
+                self.status.configure(text=msg)
+            except Exception:
+                pass
+
     def run_egg(self):
         ok_models = [r["model"] for r in self.results
                      if r["status"] == OK and r.get("kind") == "chat"]
@@ -3625,6 +3724,9 @@ class App(tk.Tk):
         # 先弹窗，实时显示进度
         dlg = EggDialog(self, [], total=len(picks), pending=picks)
         self._egg_dlg = dlg
+        # 用户点关闭/ESC 时立刻复位，避免按钮卡在禁用状态
+        dlg.bind("<Destroy>", lambda e, d=dlg: (
+            self._finish_egg("彩蛋已关闭") if e.widget is d else None), add="+")
         self._egg_url, self._egg_key = url, key
 
         self._egg_paused = False
@@ -3725,8 +3827,18 @@ class App(tk.Tk):
         return " ".join(parts) if parts else "—"
 
     def _detail_text(self, r):
+        """说明列：可用模型也给出一句话，避免整列空白。"""
         if r["status"] == OK:
-            return f"流式未通过：{r['stream_why']}" if r.get("stream_why") else ""
+            if r.get("stream_why"):
+                return f"流式未通过：{r['stream_why']}"
+            return "连通性检测通过 · 流式/工具响应正常"
+        if r["status"] == DEGRADED:
+            zh = r.get("zh") or zh_reason(r["http"], r.get("detail", ""))
+            return f"{r['http']} · {zh}（参数受限，模型可用）" if r["http"] else zh
+        if r["status"] == PENDING:
+            return "等待检测"
+        if r["status"] == SKIP:
+            return "已跳过（专用模型，需单独检测）"
         zh = r.get("zh") or zh_reason(r["http"], r.get("detail", ""))
         return f"{r['http']} · {zh}" if r["http"] else zh
 
@@ -3885,13 +3997,13 @@ class App(tk.Tk):
         self._fit_job = self.after(160, self._do_fit)
 
     def _do_fit(self):
+        """重算列宽。检测过程中也要执行：否则列宽停留在启动时的窄值，
+        模型名会被截断，直到检测结束才恢复——这就是「检测中名字不全」的原因。"""
         self._fit_job = None
-        if getattr(self, "_running", False):
-            return
         old_w = self.table.column("model", "width")
         self._fit_columns()
         new_w = self.table.column("model", "width")
-        # 列宽变化后必须重排，否则行内存的仍是旧宽度算出的省略文本
+        # 列宽变化后必须重排，否则行内仍是按旧宽度算出的省略文本
         if abs(new_w - old_w) > 4:
             self._render()
 
@@ -3906,20 +4018,24 @@ class App(tk.Tk):
             return
         longest = getattr(self, "_max_model_px", 0)
 
-        # 四档预算：窗口越窄，固定列同步收紧，保证七列始终塞进视口
-        if total >= 780:
-            w_status, w_spec, w_lat, w_price, min_left = 56, 86, 54, 156, 150
-        elif total >= 640:
-            w_status, w_spec, w_lat, w_price, min_left = 52, 78, 50, 140, 130
+        # 价格列按实际内容宽度自适应（最多 3 个价格数字 + 单位），不浪费空间
+        # 「输入¥0.7 / 输出¥5.7」需约 120px，下限要留足余量
+        price_need = getattr(self, "_price_px", 0) + 22
+        w_price = max(148, min(178, price_need))
+
+        # 三档预算：窗口越窄，固定列同步收紧，保证七列始终塞进视口
+        if total >= 760:
+            w_status, w_spec, w_lat = 56, 82, 52
+        elif total >= 620:
+            w_status, w_spec, w_lat = 52, 74, 48
         else:
-            w_status, w_spec, w_lat, w_price, min_left = 46, 66, 46, 118, 110
+            w_status, w_spec, w_lat = 46, 64, 44
 
         rest = total - w_status - w_spec - w_lat - w_price
-        # 说明列优先级高于模型列：先保住说明能显示完整错误原因（约 118px）
-        cap_floor = 150                    # 能力列需容纳「流式✓ 工具✓ 思考✓ 计量✓」
-        detail_floor = 118 if rest > 420 else 92
-        w_model = min(longest + 18, 260)
-        # 先留出能力列与说明列，剩余才是模型列
+        cap_floor = 148                    # 能力列需容纳「流式✓ 工具✓ 思考✓ 计量✓」
+        # 说明列给足空间：缩短与价格列的距离，保证窗口变窄时仍可见
+        detail_floor = 132 if rest > 430 else (104 if rest > 330 else 84)
+        w_model = min(longest + 16, 268)
         w_model = max(88, min(w_model, rest - cap_floor - detail_floor))
         left = max(cap_floor + detail_floor, rest - w_model)
         w_cap = cap_floor
@@ -3996,6 +4112,13 @@ class App(tk.Tk):
             except Exception:
                 pass
             self._measured_count = names
+            # 同时测量价格列最长内容，供列宽分配使用
+            try:
+                self._price_px = max((self._fcell.measure(price_for(r["model"]))
+                                      for r in self.results
+                                      if price_for(r["model"])), default=0)
+            except Exception:
+                self._price_px = 0
             if abs(self._max_model_px - prev_max) > 8:
                 self._schedule_fit()
         done = [r for r in self.results if r["status"] not in (PENDING, SKIP)]
@@ -4047,12 +4170,39 @@ class App(tk.Tk):
         self._schedule_row_refresh()
 
     def _sort(self, col):
-        rows = [(self.table.set(iid, col), iid) for iid in self.table.get_children()]
+        """列排序。延迟/能力/价格排序时，可用（含受限）的模型始终置顶——
+        把不可用的排在前面没有意义，用户要看的是「能用的里面谁最快」。
+        """
+        iids = self.table.get_children()
+        rows = [(self.table.set(iid, col), iid) for iid in iids]
         rev = self._sort_reverse.get(col, False)
+
+        def status_rank(iid):
+            r = self._sel_result(iid)
+            if not r:
+                return 9
+            return GROUP.get(r["status"], 9)
+
+        # 这些列只在「可用」集合内部排序，不可用的一律沉底
+        usable_first = col in ("latency", "cap", "price", "spec")
+
         if col == "status":
-            rows.sort(key=lambda t: GROUP.get(t[0].split(" ", 1)[-1], 9), reverse=rev)
+            rows.sort(key=lambda t: (GROUP.get(t[0].split(" ", 1)[-1], 9),
+                                     t[1]), reverse=rev)
         elif col == "latency":
-            rows.sort(key=lambda t: int(t[0].split()[0]) if t[0].endswith("ms") else 10 ** 9, reverse=rev)
+            def lv(t):
+                txt = t[0].strip()
+                if txt.endswith("ms"):
+                    try:
+                        return int(txt.split()[0])
+                    except Exception:
+                        return 10 ** 9
+                return 10 ** 9
+            rows.sort(key=lambda t: lv(t), reverse=rev)
+        elif col == "cap":
+            # 能力列按「能力项数量」排序（流式/工具/思考/计量 的勾数）
+            rows.sort(key=lambda t: t[0].count("✓") - t[0].count("✗") * 2,
+                      reverse=not rev)
         elif col == "price":
             def pv(t):
                 try:
@@ -4062,9 +4212,18 @@ class App(tk.Tk):
             rows.sort(key=pv, reverse=rev)
         else:
             rows.sort(key=lambda t: t[0].lower(), reverse=rev)
+
+        if usable_first:
+            # 稳定排序：先按状态分组（可用→受限→其他），组内保持上面的排序结果
+            rows.sort(key=lambda t: 0 if status_rank(t[1]) <= 1 else 1)
+
         for i, (_, iid) in enumerate(rows):
             self.table.move(iid, "", i)
         self._sort_reverse[col] = not rev
+        try:
+            self.table.yview_moveto(0)
+        except Exception:
+            pass
 
     def _hover_detail(self, e):
         if getattr(self, "_resizing", False):
@@ -4102,74 +4261,244 @@ class App(tk.Tk):
             self._tipwin = None
         self._tip_key = None
 
-    def _popup(self, event):
+    # ---------- 按住左键拖动多选
+    def _drag_start(self, event):
+        """记录拖拽起点。点在表头上不参与拖选（那是排序）。"""
+        self._dragging = False
+        if self.table.identify_region(event.x, event.y) == "heading":
+            self._drag_anchor = None
+            return
         iid = self.table.identify_row(event.y)
-        if iid:
-            if iid not in self.table.selection():
-                self.table.selection_set(iid)
+        if not iid:
+            self._drag_anchor = None
+            return
+        # Ctrl 按下时不作为拖选起点，交给原生 Ctrl 单击逻辑
+        ctrl = bool(event.state & 0x0004)
+        self._ctrl_at_start = ctrl
+        self._drag_anchor = iid
+        self._drag_seed = list(self.table.selection()) if ctrl else []
+
+    def _drag_move(self, event):
+        if not getattr(self, "_drag_anchor", None):
+            return
+        # 拖到可视区上下边缘时自动滚动，否则一屏外的行选不到
+        h = self.table.winfo_height()
+        if event.y < 24:
+            self.table.yview_scroll(-1, "units")
+        elif event.y > h - 24:
+            self.table.yview_scroll(1, "units")
+        iid = self.table.identify_row(max(1, min(h - 2, event.y)))
+        if not iid:
+            return
+        order = list(self.table.get_children())
+        try:
+            a = order.index(self._drag_anchor)
+            b = order.index(iid)
+        except ValueError:
+            return
+        if a == b and not self._dragging:
+            return
+        self._dragging = True
+        lo, hi = (a, b) if a <= b else (b, a)
+        keep = list(getattr(self, "_drag_seed", [])) if getattr(self, "_ctrl_at_start", False) else []
+        rng = [x for x in order[lo:hi + 1] if x not in keep]
+        self.table.selection_set(tuple(keep + rng))
+
+    def _drag_end(self, event):
+        # 拖动结束后清掉锚点，避免影响后续单击
+        self._drag_anchor = None
+        self._dragging = False
+        self._drag_seed = []
+
+    def _on_double(self, event):
+        """双击某行：打开详情。点在表头或空白处则不响应。"""
+        iid = self.table.identify_row(event.y)
+        if not iid:
+            return "break"
+        self.table.selection_set(iid)
+        self.show_detail()
+        return "break"
+
+    def retest_latency(self):
+        """只重测选中模型的延迟，不跑完整能力探测。"""
+        sel = self._menu_targets()
+        if not sel:
+            return
+        url = normalize_base(self.url_var.get())
+        key = self.key_var.get().strip()
+        if not url or not key:
+            messagebox.showwarning(APP_NAME, "请先填写接口地址与 API Key")
+            return
+        timeout = float(self.timeout_var.get() or 20)
+        models = [r["model"] for r in sel]
+        self.status.configure(text=f"正在重测 {len(models)} 个模型的延迟…")
+
+        opts = {"tokens": max(1, int(float(self.tokens_var.get() or 1)))}
+
+        def work():
+            out = []
+            for m in models:
+                ms = None
+                try:
+                    if kind_of(m) in ("image", "audio", "video"):
+                        res = test_special(url, key, m, timeout)
+                    else:
+                        res = test_model(url, key, m, opts, timeout, 1)
+                    if isinstance(res, dict):
+                        ms = res.get("latency")
+                except Exception:
+                    ms = None
+                out.append((m, ms))
+            self.q.put(("lat", out))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_latency(self, out):
+        """把重测到的延迟写回结果并刷新对应行。"""
+        n = 0
+        for m, ms in out:
+            for r in self.results:
+                if r["model"] == m:
+                    if ms is not None:
+                        r["latency"] = int(ms)
+                        n += 1
+                    break
+            self._refresh_row(m)
+        self.status.configure(text=f"延迟重测完成 · 已更新 {n} 个模型")
+        self._update_stats()
+
+    def _popup(self, event):
+        """右键菜单。要点：tk_popup 会让菜单抢焦点并清空 Treeview 的选区，
+        所以先把选区快照下来，菜单命令执行前再恢复，否则多选会丢。
+        """
+        iid = self.table.identify_row(event.y)
+        if not iid:
+            return
+        cur = list(self.table.selection())
+        if iid not in cur:
+            # 右键点在选区外：改为只选中该行（符合常见交互习惯）
+            self.table.selection_set(iid)
+            self._menu_sel = [iid]
+        else:
+            self._menu_sel = cur
+        try:
             self.menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menu.grab_release()
+            # 恢复选区，避免菜单关闭后整片高亮消失
+            self._restore_menu_sel()
+
+    def _restore_menu_sel(self):
+        keep = getattr(self, "_menu_sel", None) or []
+        exist = [i for i in keep if self.table.exists(i)]
+        if not exist:
+            return
+        cur = set(self.table.selection())
+        if set(exist) != cur:
+            self.table.selection_set(exist)
+
+    def _menu_targets(self):
+        """菜单命令要作用的目标行：优先用右键时的快照。"""
+        keep = getattr(self, "_menu_sel", None) or []
+        rows = [self._sel_result(i) for i in keep if self.table.exists(i)]
+        rows = [r for r in rows if r]
+        if rows:
+            return rows
+        rows = [self._sel_result(i) for i in self.table.selection()]
+        return [r for r in rows if r]
 
     def _sel_result(self, iid):
-        try:
-            want = int(iid[1:])
-        except Exception:
+        """按 iid 反查结果对象。iid 形如 "row:<模型名>"（v2.3 起改用稳定 iid）。"""
+        if not iid:
             return None
+        name = iid[4:] if iid.startswith("row:") else iid
         for r in self.results:
-            if id(r) == want:
+            if r["model"] == name:
                 return r
         return None
 
     def show_detail(self, event=None):
-        sel = self.table.selection()
-        if not sel:
+        """查看详情。选中多个时合并到一个窗口，先给汇总再逐个展开。"""
+        rows = self._menu_targets()
+        if not rows:
             return
-        r = self._sel_result(sel[0])
-        if not r:
-            return
+        multi = len(rows) > 1
         top = tk.Toplevel(self)
-        top.title("模型详情")
+        top.title(f"模型详情（{len(rows)} 个）" if multi else "模型详情")
         top.configure(bg=BG)
-        top.geometry("640x460")
+        top.geometry("780x620" if multi else "660x480")
+        top.minsize(560, 380)
         top.transient(self)
+
         body = tk.Frame(top, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
         txt = tk.Text(body, wrap="word", bd=0, highlightthickness=0, bg=CARD, fg=TEXT,
-                      font=(self.f, 10), padx=14, pady=12)
-        txt.pack(fill="both", expand=True)
+                      font=(self.f, 10), padx=14, pady=12, width=1)
+        sbr = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sbr.set)
+        sbr.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
 
         def cap(v, yes="支持", no="不支持"):
             return "未检测" if v is None else (yes if v else no)
 
-        tok = r.get("tokens")
-        toktxt = f"{tok['prompt']} + {tok['completion']} = {tok['total']}" if tok else "—"
-        txt.insert("1.0", "\n".join([
-            f"模型：{r['model']}",
-            f"状态：{r['status']}",
-            f"类型：{r['kind']}",
-            f"HTTP：{r['http'] if r['http'] is not None else '—'}",
-            f"延迟：{str(r['latency']) + ' ms' if r.get('latency') else '—'}",
-            f"流式：{cap(r.get('stream'))}",
-            f"工具调用：{cap(r.get('tools'))}",
-            f"思考能力：{think_text(r)}",
-            f"上下文 / 最大输出：{spec_text(r['model'])} tokens",
-            f"usage 计量：{cap(r.get('usage'), '有', '无')}",
-            f"Token（提示+生成=合计）：{toktxt}",
-            f"参考价格（¥/百万 token）：{price_for(r['model']) or '未收录'}",
-            "",
-            "原因（中文）：",
-            self._detail_text(r) or "（无）",
-            "",
-            "上游原始返回：",
-            r.get("detail") or "（无）",
-        ]))
+        def block(r, idx=None):
+            tok = r.get("tokens")
+            toktxt = f"{tok['prompt']} + {tok['completion']} = {tok['total']}" if tok else "—"
+            lines = [
+                (f"【{idx}】{r['model']}" if idx else f"模型：{r['model']}"),
+                f"状态：{r['status']}",
+                f"类型：{r['kind']}",
+                f"HTTP：{r['http'] if r['http'] is not None else '—'}",
+                f"延迟：{str(r['latency']) + ' ms' if r.get('latency') else '—'}",
+                f"流式：{cap(r.get('stream'))}",
+                f"工具调用：{cap(r.get('tools'))}",
+                f"思考能力：{think_text(r)}",
+                f"上下文 / 最大输出：{spec_text(r['model'])} tokens",
+                f"usage 计量：{cap(r.get('usage'), '有', '无')}",
+                f"Token（提示+生成=合计）：{toktxt}",
+                f"参考价格（¥/百万 token）：{price_for(r['model']) or '未收录'}",
+                "",
+                "原因（中文）：",
+                self._detail_text(r) or "（无）",
+            ]
+            if (r.get("detail") or "").strip():
+                lines += ["", "上游原始返回：", r["detail"].strip()]
+            return lines
+
+        chunks = []
+        if multi:
+            chunks.append(f"共选中 {len(rows)} 个模型")
+            chunks.append("")
+            for i, r in enumerate(rows, 1):
+                lat = f"{r['latency']} ms" if r.get("latency") else "—"
+                chunks.append(f"{i:>2}. {r['status']:<4}  {lat:>9}  {r['model']}")
+            chunks += ["", "=" * 48, ""]
+            for i, r in enumerate(rows, 1):
+                chunks += block(r, i)
+                if i < len(rows):
+                    chunks += ["", "-" * 48, ""]
+        else:
+            chunks += block(rows[0])
+
+        txt.insert("1.0", "\n".join(chunks))
         txt.configure(state="disabled")
+
         bar = tk.Frame(top, bg=BG)
         bar.pack(fill="x", side="bottom", padx=16, pady=(0, 16))
         body.pack(fill="both", expand=True, padx=16, pady=16)
-        ttk.Button(bar, text="复制模型名", style="Ghost.TButton",
-                   command=lambda: self._clip(r["model"])).pack(side="left")
+        ttk.Button(bar, text=(f"复制全部模型名（{len(rows)}）" if multi else "复制模型名"),
+                   style="Ghost.TButton",
+                   command=lambda: self._clip("\n".join(r["model"] for r in rows))
+                   ).pack(side="left")
+        if multi:
+            ttk.Button(bar, text="重测这些延迟", style="Ghost.TButton",
+                       command=lambda: (top.destroy(), self._menu_targets() and self.retest_latency())
+                       ).pack(side="left", padx=(8, 0))
         ttk.Button(bar, text="关闭", style="Primary.TButton", width=8,
                    command=top.destroy).pack(side="right")
         top.bind("<Escape>", lambda e: top.destroy())
+        top.update_idletasks()
+        center_on(top, self)
 
     def _clip(self, text):
         self.clipboard_clear()
